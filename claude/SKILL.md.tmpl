@@ -30,9 +30,14 @@ modify files.
 
 The generated external invocation name is `gstack-claude`.
 
-Claude outside voices default to the frontier model via `{{CLAUDE_MODEL_FLAG}}`.
-Use `GSTACK_CLAUDE_MODEL=<model>` to override it. If the user names a model in
-the request, replace the default `--model` value with their model for every call,
+Claude outside voices default to a pinned cross-family opposition model at MEDIUM
+reasoning effort via `{{CLAUDE_MODEL_FLAG}}` — owner decision (2026-09-14):
+cross-family opposition defaults to MEDIUM with pinned models; high/xhigh only by
+explicit choice. The model is pinned as `claude-fable-5`, never the moving alias
+`claude-fable-5-1` or a bare `fable`. Use `GSTACK_CLAUDE_MODEL=<model>` and
+`GSTACK_CLAUDE_EFFORT=<level>` to override the shell-wide defaults. If the user
+names a model or an effort level (e.g. `--high`, `--xhigh`) in the request, replace
+the corresponding default `--model`/`--effort` value with theirs for every call,
 including resumed sessions.
 
 ---

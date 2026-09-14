@@ -20,6 +20,23 @@
 
 export const CLAUDE_FRONTIER_EVAL_MODEL = "claude-fable-5-1";
 
+/**
+ * Cross-family opposition default — the model the `/claude` outside-voice
+ * skill (Codex's "ask Claude" second opinion) pins for its `claude -p`
+ * calls. Deliberately separate from CLAUDE_FRONTIER_EVAL_MODEL above: that
+ * constant drives gstack's own internal eval-harness capture/judge calls,
+ * a different blast radius than what model reviews a user's diff.
+ *
+ * Owner decision (2026-09-14): cross-family opposition defaults to MEDIUM
+ * reasoning effort on a PINNED, non-moving model — never a `-1`/`-latest`
+ * style alias that can silently move out from under a running fleet.
+ * `claude-fable-5-1` is exactly that kind of alias; use the pinned
+ * `claude-fable-5` instead. See test/opposition-model-guard.test.ts, which
+ * fails the build if this constant (or the generated `/claude` flag) ever
+ * regresses to `claude-fable-5-1` or a bare `fable`.
+ */
+export const CLAUDE_OPPOSITION_MODEL = "claude-fable-5";
+
 // `as const satisfies` keeps EvalModelKind the literal union
 // 'capture' | 'warmup' | 'distill' — a `Record<string, string>` annotation
 // would widen it to string and let any typo through the type gate.

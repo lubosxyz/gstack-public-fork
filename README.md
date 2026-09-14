@@ -141,14 +141,19 @@ override applies to that run only; set `model` in your Codex `config.toml` to
 make it stick across upgrades. After changing your Codex model, rerun
 `./setup --host codex` to regenerate the skills.
 
-gstack-owned Codex invocations and evals default to `gpt-6-astra`. Set
-`GSTACK_CODEX_MODEL=<model>` to override that runtime default; an explicitly
-requested model takes precedence. Runtime model selection is separate from
-the setup-time behavioral profile above. The Claude outside-voice skill
-(`gstack-claude` on Codex) defaults to `claude-fable-5-1`, overridable with
-`GSTACK_CLAUDE_MODEL=<model>` or an explicit model in your request. These are
-known frontier pins maintained in gstack releases, with no automatic model
-discovery. See [eval defaults and overrides](CONTRIBUTING.md#testing--evals)
+gstack-owned Codex invocations and evals default to `gpt-6-astra` at `medium`
+reasoning effort for the review/challenge opposition modes (owner decision
+2026-09-14: cross-family opposition defaults to MEDIUM with pinned models;
+high/xhigh only by explicit choice). Set `GSTACK_CODEX_MODEL=<model>` or
+`GSTACK_CODEX_EFFORT=<level>` to override those runtime defaults; an explicitly
+requested model or `--high`/`--xhigh` takes precedence. Runtime model selection
+is separate from the setup-time behavioral profile above. The Claude
+outside-voice skill (`gstack-claude` on Codex) mirrors that policy: it defaults
+to the pinned `claude-fable-5` at `medium` effort — never the moving alias
+`claude-fable-5-1` or a bare `fable` — overridable with `GSTACK_CLAUDE_MODEL=<model>`,
+`GSTACK_CLAUDE_EFFORT=<level>`, or an explicit model/effort in your request.
+These are known frontier pins maintained in gstack releases, with no automatic
+model discovery. See [eval defaults and overrides](CONTRIBUTING.md#testing--evals)
 for capture, judge, and benchmark model selection.
 
 **Want to add support for another agent?** See [docs/ADDING_A_HOST.md](docs/ADDING_A_HOST.md).

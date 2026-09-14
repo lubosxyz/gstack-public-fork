@@ -167,12 +167,17 @@ The three modes are MUTUALLY EXCLUSIVE — at most one runs per invocation. Once
 the mode is determined, read ONLY that mode's section (see the Section index
 above); never read the other two mode sections.
 
-**Reasoning effort override:** If the user's input contains `--xhigh` anywhere,
-note it and remove it from the prompt text before passing to Codex. When `--xhigh`
-is present, use `model_reasoning_effort="xhigh"` for all modes regardless of the
-per-mode default below. Otherwise, use the per-mode defaults:
-- Review (2A): `high` — bounded diff input, needs thoroughness
-- Challenge (2B): `high` — adversarial but bounded by diff
+**Reasoning effort override:** If the user's input contains `--xhigh` or `--high`
+anywhere, note it and remove it from the prompt text before passing to Codex. When
+`--xhigh` is present, use `model_reasoning_effort="xhigh"` for all modes regardless
+of the per-mode default below; when `--high` is present (and `--xhigh` is not), use
+`model_reasoning_effort="high"`. An explicit per-request flag always wins over both
+the per-mode default and any shell-wide `GSTACK_CODEX_EFFORT` override. Otherwise,
+use the per-mode defaults:
+- Review (2A): `medium` (`GSTACK_CODEX_EFFORT`, default `medium`) — cross-family
+  opposition default (owner decision 2026-09-14); ask `--high`/`--xhigh` for more
+- Challenge (2B): `medium` (`GSTACK_CODEX_EFFORT`, default `medium`) — same opposition
+  default; ask `--high`/`--xhigh` for more
 - Consult (2C): `medium` — large context, interactive, needs speed
 
 ---
@@ -235,14 +240,19 @@ model in the `/codex` prompt.
 Native `codex review` also sets `review_model` to the selected model so a separate
 review pin in the CLI config cannot override the request.
 
-**Reasoning effort (per-mode defaults):**
-- **Review (2A):** `high` — bounded diff input, needs thoroughness but not max tokens
-- **Challenge (2B):** `high` — adversarial but bounded by diff size
+**Reasoning effort (per-mode defaults):** Owner decision (2026-09-14): cross-family
+opposition defaults to MEDIUM with pinned models; high/xhigh only by explicit choice.
+- **Review (2A):** `medium` via `{{CODEX_REASONING_EFFORT_FLAG}}` — override the
+  shell-wide default with `GSTACK_CODEX_EFFORT=<level>`, or ask `--high`/`--xhigh`
+  per request when you want more thoroughness and are willing to wait
+- **Challenge (2B):** `medium` via `{{CODEX_REASONING_EFFORT_FLAG}}` — same override
+  paths as Review
 - **Consult (2C):** `medium` — large context (plans, codebase), interactive, needs speed
 
 `xhigh` uses ~23x more tokens than `high` and causes 50+ minute hangs on large context
-tasks (OpenAI issues #8545, #8402, #6931). Users can override with `--xhigh` flag
-(e.g., `/codex review --xhigh`) when they want maximum reasoning and are willing to wait.
+tasks (OpenAI issues #8545, #8402, #6931), so it is never a default — only an explicit
+per-request `--xhigh` (e.g., `/codex review --xhigh`) enables it. `--high` is the
+explicit ask for the old default without paying the `xhigh` tax.
 
 **Web search:** All codex commands pass `{{CODEX_WEB_SEARCH_FLAG}}` so `codex exec`
 invocations can look up docs and APIs during review. This is OpenAI's cached index —

@@ -70,6 +70,22 @@ export const CODEX_MODEL_CONFIG_FLAG = `-c "model=\\"\${GSTACK_CODEX_MODEL:-${CO
 export const CODEX_REVIEW_MODEL_CONFIG_FLAG = `${CODEX_MODEL_CONFIG_FLAG} -c "review_model=\\"\${GSTACK_CODEX_MODEL:-${CODEX_FRONTIER_MODEL}}\\""`;
 
 /**
+ * Default cross-family opposition reasoning effort for Codex review (2A) and
+ * challenge (2B) modes.
+ *
+ * Owner decision (2026-09-14): cross-family opposition defaults to MEDIUM
+ * with pinned models; high/xhigh only by explicit user choice (`--high` /
+ * `--xhigh` in the `/codex` request — see codex/SKILL.md.tmpl's "Reasoning
+ * effort override" section, which swaps this flag's literal value rather
+ * than relying on the env var for an explicit per-request ask).
+ * GSTACK_CODEX_EFFORT overrides the shell-wide default. Double-quoted (unlike
+ * CODEX_WEB_SEARCH_FLAG's static single-quoted literal) because it needs
+ * real `${...}` shell expansion, the same form CODEX_MODEL_CONFIG_FLAG uses.
+ */
+export const CODEX_DEFAULT_EFFORT = 'medium';
+export const CODEX_REASONING_EFFORT_FLAG = `-c "model_reasoning_effort=\\"\${GSTACK_CODEX_EFFORT:-${CODEX_DEFAULT_EFFORT}}\\""`;
+
+/**
  * Shared Codex error handling block for resolver output.
  * Used by ADVERSARIAL_STEP, CODEX_PLAN_REVIEW, CODEX_SECOND_OPINION,
  * DESIGN_OUTSIDE_VOICES, DESIGN_REVIEW_LITE, DESIGN_SKETCH.

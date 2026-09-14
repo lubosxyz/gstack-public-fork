@@ -1,6 +1,6 @@
 import type { TemplateContext } from './types';
-import { CODEX_MODEL_CONFIG_FLAG, CODEX_REVIEW_MODEL_CONFIG_FLAG, CODEX_WEB_SEARCH_FLAG } from './constants';
-import { CLAUDE_FRONTIER_EVAL_MODEL } from '../../lib/eval-model';
+import { CODEX_MODEL_CONFIG_FLAG, CODEX_REVIEW_MODEL_CONFIG_FLAG, CODEX_WEB_SEARCH_FLAG, CODEX_REASONING_EFFORT_FLAG } from './constants';
+import { CLAUDE_OPPOSITION_MODEL } from '../../lib/eval-model';
 
 /**
  * {{CODEX_WEB_SEARCH_FLAG}} — the non-deprecated codex web-search flag
@@ -24,8 +24,26 @@ export function generateCodexReviewModelConfigFlag(_ctx: TemplateContext): strin
   return CODEX_REVIEW_MODEL_CONFIG_FLAG;
 }
 
+/**
+ * {{CODEX_REASONING_EFFORT_FLAG}} — cross-family opposition reasoning effort
+ * for Codex review/challenge modes. Owner decision (2026-09-14): opposition
+ * defaults to MEDIUM; users can still ask for `high`/`xhigh` explicitly per
+ * request (see codex/SKILL.md.tmpl), and GSTACK_CODEX_EFFORT overrides the
+ * shell-wide default without touching the model pin.
+ */
+export function generateCodexReasoningEffortFlag(_ctx: TemplateContext): string {
+  return CODEX_REASONING_EFFORT_FLAG;
+}
+
+/**
+ * {{CLAUDE_MODEL_FLAG}} — the pinned cross-family opposition model + effort
+ * for the `/claude` outside-voice skill. Owner decision (2026-09-14): a
+ * PINNED non-moving model (never `claude-fable-5-1` or a bare `fable`
+ * alias) at MEDIUM effort by default; GSTACK_CLAUDE_MODEL / GSTACK_CLAUDE_EFFORT
+ * override per shell, an explicit model/effort in the request overrides per call.
+ */
 export function generateClaudeModelFlag(_ctx: TemplateContext): string {
-  return `--model "\${GSTACK_CLAUDE_MODEL:-${CLAUDE_FRONTIER_EVAL_MODEL}}"`;
+  return `--model "\${GSTACK_CLAUDE_MODEL:-${CLAUDE_OPPOSITION_MODEL}}" --effort "\${GSTACK_CLAUDE_EFFORT:-medium}"`;
 }
 
 export function generateSlugEval(ctx: TemplateContext): string {

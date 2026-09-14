@@ -1064,15 +1064,18 @@ separate review-model pin.
 
 On Codex hosts, the Claude outside-voice skill is `gstack-claude`. Its review,
 challenge, and consult calls, including resumed sessions, use
-`--model "${GSTACK_CLAUDE_MODEL:-claude-fable-5-1}"`; a model named in your
-request takes precedence. Both defaults are known frontier pins maintained
-in gstack releases, with no automatic model discovery.
+`--model "${GSTACK_CLAUDE_MODEL:-claude-fable-5}" --effort "${GSTACK_CLAUDE_EFFORT:-medium}"`;
+a model or effort level named in your request takes precedence. Owner decision
+(2026-09-14): cross-family opposition defaults to MEDIUM effort on a pinned,
+non-moving model — never `claude-fable-5-1` or a bare `fable` alias — with
+high/xhigh only by explicit choice, mirroring the same policy on the Codex
+side below.
 
 ### Three modes
 
 **Review** — run `codex review` against the current diff. Codex reads every changed file, classifies findings by severity (P1 critical, P2 high, P3 medium), and returns a PASS/FAIL verdict. Any P1 finding = FAIL. The review is fully independent — Codex doesn't see Claude's review.
 
-**Challenge** — adversarial mode. Codex actively tries to break your code. It looks for edge cases, race conditions, security holes, and assumptions that would fail under load. Uses maximum reasoning effort (`xhigh`). Think of it as a penetration test for your logic.
+**Challenge** — adversarial mode. Codex actively tries to break your code. It looks for edge cases, race conditions, security holes, and assumptions that would fail under load. Defaults to `medium` reasoning effort (`GSTACK_CODEX_EFFORT`, same cross-family opposition default as Review); ask `--high` or `--xhigh` when you want more thoroughness and are willing to wait. Think of it as a penetration test for your logic.
 
 **Consult** — open conversation with session continuity. Ask Codex anything about the codebase. Follow-up questions reuse the same session, so context carries over. Great for "am I thinking about this correctly?" moments.
 

@@ -45,7 +45,7 @@ cd "$_REPO_ROOT"
 # The 330s wrapper sits BELOW the 360s Bash gate so the wrapper fires FIRST
 # and a stall surfaces as a diagnosable exit 124 with an explicit message,
 # never as a silent harness kill that downstream reads as "no findings".
-_gstack_codex_timeout_wrapper 330 codex review --base <base> -c 'sandbox_mode="read-only"' -c "model=\"${GSTACK_CODEX_MODEL:-gpt-6-astra}\"" -c "review_model=\"${GSTACK_CODEX_MODEL:-gpt-6-astra}\"" -c 'model_reasoning_effort="high"' -c 'web_search="cached"' < /dev/null 2>"$TMPERR"
+_gstack_codex_timeout_wrapper 330 codex review --base <base> -c 'sandbox_mode="read-only"' -c "model=\"${GSTACK_CODEX_MODEL:-gpt-6-astra}\"" -c "review_model=\"${GSTACK_CODEX_MODEL:-gpt-6-astra}\"" -c "model_reasoning_effort=\"${GSTACK_CODEX_EFFORT:-medium}\"" -c 'web_search="cached"' < /dev/null 2>"$TMPERR"
 _CODEX_EXIT=$?
 if [ "$_CODEX_EXIT" = "124" ]; then
   _gstack_codex_log_event "codex_timeout" "330"
@@ -61,7 +61,11 @@ elif [ "$_CODEX_EXIT" != "0" ]; then
 fi
 ```
 
-If the user passed `--xhigh`, use `"xhigh"` instead of `"high"`.
+Defaults to `medium` reasoning effort (override the shell-wide default with
+`GSTACK_CODEX_EFFORT=<level>`). If the user passed `--xhigh` or `--high`, replace
+`-c "model_reasoning_effort=\"${GSTACK_CODEX_EFFORT:-medium}\""` with the literal `-c 'model_reasoning_effort="xhigh"'`
+or `-c 'model_reasoning_effort="high"'` for that call — an explicit per-request ask
+always wins over both the medium default and any `GSTACK_CODEX_EFFORT` override.
 
 **Custom-instructions path (user typed `/codex review <focus>`):** custom instructions
 cannot ride along with `--base` — that is exactly the combination the CLI rejects — and
@@ -86,7 +90,7 @@ _PROMPT_FILE=$(mktemp "$TMP_ROOT/codex-prompt-XXXXXX")
   git diff "<base>...HEAD" 2>/dev/null
   printf '\nDIFF_END\n'
 } > "$_PROMPT_FILE"
-_gstack_codex_timeout_wrapper 330 codex exec -s read-only "$(cat "$_PROMPT_FILE")" -c "model=\"${GSTACK_CODEX_MODEL:-gpt-6-astra}\"" -c 'model_reasoning_effort="high"' -c 'web_search="cached"' < /dev/null 2>"$TMPERR"
+_gstack_codex_timeout_wrapper 330 codex exec -s read-only "$(cat "$_PROMPT_FILE")" -c "model=\"${GSTACK_CODEX_MODEL:-gpt-6-astra}\"" -c "model_reasoning_effort=\"${GSTACK_CODEX_EFFORT:-medium}\"" -c 'web_search="cached"' < /dev/null 2>"$TMPERR"
 _CODEX_EXIT=$?
 rm -f "$_PROMPT_FILE"
 if [ "$_CODEX_EXIT" = "124" ]; then

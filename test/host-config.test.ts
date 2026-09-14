@@ -460,12 +460,15 @@ describe('golden-file regression', () => {
     fs.rmSync(GOLDEN_OUT, { recursive: true, force: true });
   });
 
-  test('every Claude outside-voice invocation selects the overridable frontier model', () => {
+  test('every Claude outside-voice invocation selects the pinned opposition model at medium effort', () => {
+    // Owner decision (2026-09-14): cross-family opposition defaults to MEDIUM
+    // effort on a pinned, non-moving model (claude-fable-5, never the moving
+    // alias claude-fable-5-1 or a bare "fable") — see test/opposition-model-guard.test.ts.
     const rendered = fs.readFileSync(path.join(GOLDEN_OUT, '.agents/skills/gstack-claude/SKILL.md'), 'utf8');
     const calls = rendered.split('\n').filter(line => line.includes('"$CLAUDE_BIN" -p'));
     expect(calls).toHaveLength(4);
     for (const call of calls) {
-      expect(call).toContain('--model "${GSTACK_CLAUDE_MODEL:-claude-fable-5-1}"');
+      expect(call).toContain('--model "${GSTACK_CLAUDE_MODEL:-claude-fable-5}" --effort "${GSTACK_CLAUDE_EFFORT:-medium}"');
     }
   });
 
