@@ -20,9 +20,10 @@
  * capture/judge model (CLAUDE_FRONTIER_EVAL_MODEL) — that one is allowed
  * to stay on claude-fable-5-1; only the opposition path is pinned here.
  */
-import { describe, test, expect } from 'bun:test';
+import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { execFileSync } from 'child_process';
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 import {
   CODEX_FRONTIER_MODEL,
@@ -135,14 +136,24 @@ describe('Claude opposition (/claude outside voice) is pinned, never a moving al
   });
 
   test('the flag actually expands to the pinned model + medium effort and honors env overrides', () => {
+    // Strip every opposition-effort/model env var from the child process
+    // before asserting the DEFAULT expansion — an ambient
+    // GSTACK_CLAUDE_MODEL/GSTACK_CLAUDE_EFFORT/GSTACK_CODEX_EFFORT in the
+    // *test runner's own* environment (e.g. someone running
+    // `GSTACK_CLAUDE_EFFORT=high bun test ...`) must not leak into this
+    // "no override" case and silently pass it off as the default.
+    const cleanEnv: NodeJS.ProcessEnv = { ...process.env };
+    delete cleanEnv.GSTACK_CLAUDE_MODEL;
+    delete cleanEnv.GSTACK_CLAUDE_EFFORT;
+    delete cleanEnv.GSTACK_CODEX_EFFORT;
+
     const argv = execFileSync('bash', ['-c', `printf '%s\\n' ${generateClaudeModelFlag(FAKE_CTX)}`], {
-      encoding: 'utf8',
-      timeout: 5000,
+      env: cleanEnv, encoding: 'utf8', timeout: 5000,
     }).trim().split('\n');
     expect(argv).toEqual(['--model', 'claude-fable-5', '--effort', 'medium']);
 
     const overridden = execFileSync('bash', ['-c', `printf '%s\\n' ${generateClaudeModelFlag(FAKE_CTX)}`], {
-      env: { ...process.env, GSTACK_CLAUDE_MODEL: 'claude-sonnet-4-6', GSTACK_CLAUDE_EFFORT: 'high' },
+      env: { ...cleanEnv, GSTACK_CLAUDE_MODEL: 'claude-sonnet-4-6', GSTACK_CLAUDE_EFFORT: 'high' },
       encoding: 'utf8',
       timeout: 5000,
     }).trim().split('\n');
@@ -186,5 +197,131 @@ describe('Claude opposition (/claude outside voice) is pinned, never a moving al
     // the opposition model, and must not happen as a side effect of this one.
     expect(CLAUDE_FRONTIER_EVAL_MODEL).toBe('claude-fable-5-1');
     expect(CLAUDE_OPPOSITION_MODEL).not.toBe(CLAUDE_FRONTIER_EVAL_MODEL);
+  });
+});
+
+// ─── Repo-wide sweep (review round 1 finding, 2026-09-14) ──────────────────
+//
+// The narrower tests above only covered the `/codex` and `/claude` skills
+// themselves. But "cross-family opposition" is not limited to those two
+// entry points: /review, /ship, /spec, the design-outside-voice skills, and
+// office-hours all launch Codex (or Claude) as an outside/adversarial voice
+// too, via SHARED resolvers (generateAdversarialStep, generateCodexPlanReview,
+// generateCodexDocReview, generateCodexSecondOpinion, generateDesignOutsideVoices,
+// generateDesignReviewLite, generateDesignSketch — scripts/resolvers/review.ts
+// and design.ts). Those resolvers used to hardcode `model_reasoning_effort="high"`
+// independently of the `/codex` skill's own fix, so fixing only `/codex` left
+// every one of those call sites — and every generated host's rendering of
+// them — still defaulting to high. This sweep scans EVERY resolver, EVERY
+// .tmpl source, and a FRESH render of EVERY configured host (not just
+// claude/codex) so a new call site added anywhere in the future, or a
+// regression in an existing one, fails here — not just in the two
+// narrowly-scoped skills above.
+describe('Repo-wide sweep — every resolver, template, and host output', () => {
+  const ROOT_DIRS_TO_SCAN = ['scripts', 'claude', 'codex', 'lib', 'hosts'];
+  const SWEEP_OUT = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-opposition-sweep-'));
+
+  beforeAll(() => {
+    // One `--host all` render covers every host in ONE pass: the claude
+    // host's own output lands at the out-dir root (e.g. `<out>/ship/SKILL.md`),
+    // and every external host under its `<hostSubdir>/skills/gstack-*`
+    // (e.g. `<out>/.agents/skills/gstack-claude/SKILL.md`) — see
+    // scripts/gen-skill-docs.ts's per-host output routing.
+    const result = Bun.spawnSync(
+      ['bun', 'run', 'scripts/gen-skill-docs.ts', '--host', 'all', '--out-dir', SWEEP_OUT],
+      { cwd: ROOT, timeout: 180_000 },
+    );
+    if (result.exitCode !== 0) {
+      throw new Error(
+        `sweep beforeAll: gen-skill-docs --host all --out-dir failed (exit ${result.exitCode}):\n`
+        + result.stderr.toString(),
+      );
+    }
+  });
+
+  afterAll(() => {
+    fs.rmSync(SWEEP_OUT, { recursive: true, force: true });
+  });
+
+  // A real Codex launch line always contains one of these two subcommands.
+  // Prose ABOUT the override mechanism (e.g. "replace X with the literal
+  // `-c 'model_reasoning_effort=\"xhigh\"'` for that call") never contains
+  // "codex exec"/"codex review" on the same line, so it can't false-positive
+  // here — verified by hand for every override sentence this PR added.
+  function isCodexInvocationLine(line: string): boolean {
+    return line.includes('codex exec') || line.includes('codex review');
+  }
+  // A real Claude outside-voice launch line always pipes into `$CLAUDE_BIN -p`.
+  function isClaudeInvocationLine(line: string): boolean {
+    return line.includes('CLAUDE_BIN" -p');
+  }
+  function hasHardcodedHighOrXhigh(line: string): boolean {
+    return line.includes('model_reasoning_effort="high"') || line.includes('model_reasoning_effort="xhigh"');
+  }
+
+  function scanForCodexEffortViolations(root: string, suffix: string): string[] {
+    const violations: string[] = [];
+    for (const file of findFiles(root, suffix)) {
+      const content = fs.readFileSync(file, 'utf-8');
+      for (const line of content.split('\n')) {
+        if (isCodexInvocationLine(line) && hasHardcodedHighOrXhigh(line)) {
+          violations.push(`${path.relative(root, file)}: ${line.trim().slice(0, 220)}`);
+        }
+      }
+    }
+    return violations;
+  }
+
+  test('no resolver .ts file hardcodes a Codex opposition/outside-voice default of high or xhigh', () => {
+    const violations = ROOT_DIRS_TO_SCAN.flatMap((d) => scanForCodexEffortViolations(path.join(ROOT, d), '.ts'));
+    expect(violations).toEqual([]);
+  });
+
+  test('no .tmpl source anywhere hardcodes a Codex opposition/outside-voice default of high or xhigh', () => {
+    const violations = scanForCodexEffortViolations(ROOT, '.tmpl');
+    expect(violations).toEqual([]);
+  });
+
+  test('a fresh render of EVERY configured host has zero hardcoded Codex high/xhigh invocation defaults', () => {
+    const violations = scanForCodexEffortViolations(SWEEP_OUT, '.md');
+    expect(violations).toEqual([]);
+  });
+
+  test('a fresh render of EVERY configured host resolves at least one Codex opposition/outside-voice call through the shared flag', () => {
+    // Guards the guard: if the resolvers stopped emitting Codex invocations
+    // at all (e.g. a refactor silently dropped the feature), the previous
+    // "zero violations" test would trivially pass on zero call sites. Assert
+    // real coverage: the rendered claude-host tree alone (ship/review/spec/
+    // design-* etc., all under SWEEP_OUT root) must contain the resolved
+    // flag's exact expansion at least once.
+    let found = 0;
+    for (const file of findFiles(SWEEP_OUT, '.md')) {
+      const content = fs.readFileSync(file, 'utf-8');
+      if (content.includes(CODEX_REASONING_EFFORT_FLAG)) found++;
+    }
+    expect(found).toBeGreaterThan(0);
+  });
+
+  test('every generated Claude outside-voice invocation, on every host, is pinned and carries --effort — never claude-fable-5-1', () => {
+    const violations: string[] = [];
+    let checked = 0;
+    for (const file of findFiles(SWEEP_OUT, '.md')) {
+      const content = fs.readFileSync(file, 'utf-8');
+      for (const line of content.split('\n')) {
+        if (!isClaudeInvocationLine(line)) continue;
+        checked++;
+        const rel = path.relative(SWEEP_OUT, file);
+        if (line.includes('claude-fable-5-1')) {
+          violations.push(`${rel}: pins claude-fable-5-1: ${line.trim().slice(0, 220)}`);
+        }
+        if (!line.includes('--effort')) {
+          violations.push(`${rel}: missing --effort flag: ${line.trim().slice(0, 220)}`);
+        }
+      }
+    }
+    // Guards the guard: fail loud if the sweep somehow found no Claude
+    // invocation lines at all, rather than silently passing on zero coverage.
+    expect(checked, 'no Claude outside-voice invocation lines found across any host — sweep is broken').toBeGreaterThan(0);
+    expect(violations).toEqual([]);
   });
 });

@@ -1756,13 +1756,19 @@ describe('DESIGN_OUTSIDE_VOICES resolver', () => {
     expect(content).toContain('design direction');
   });
 
-  test('branches correctly per skillName — different prompts', () => {
+  test('branches correctly per skillName — different prompts, same opposition effort default', () => {
     const planContent = readSkillUnion('plan-design-review');
     const consultContent = fs.readFileSync(path.join(ROOT, 'design-consultation', 'SKILL.md'), 'utf-8');
-    // plan-design-review uses analytical prompt (high reasoning)
-    expect(planContent).toContain('model_reasoning_effort="high"');
-    // design-consultation uses creative prompt (medium reasoning)
-    expect(consultContent).toContain('model_reasoning_effort="medium"');
+    // Prompts still diverge (analytical vs creative)...
+    expect(planContent).toContain('what will happen if it ships unresolved');
+    expect(consultContent).toContain('This is YOUR design direction');
+    // ...but owner decision (2026-09-14) routes BOTH through the same shared
+    // CODEX_REASONING_EFFORT_FLAG (medium default, GSTACK_CODEX_EFFORT
+    // override) instead of the old hardcoded high/medium split. See
+    // test/opposition-model-guard.test.ts for the regression guard.
+    expect(planContent).toContain('model_reasoning_effort=\\"${GSTACK_CODEX_EFFORT:-medium}\\"');
+    expect(consultContent).toContain('model_reasoning_effort=\\"${GSTACK_CODEX_EFFORT:-medium}\\"');
+    expect(planContent).not.toContain('model_reasoning_effort="high"');
   });
 });
 

@@ -1,5 +1,5 @@
 import { type TemplateContext, toShellPath } from './types';
-import { AI_SLOP_BLACKLIST, OPENAI_HARD_REJECTIONS, OPENAI_LITMUS_CHECKS, CODEX_MODEL_CONFIG_FLAG, CODEX_WEB_SEARCH_FLAG, CC_BACKGROUND_DEFAULT_SINCE } from './constants';
+import { AI_SLOP_BLACKLIST, OPENAI_HARD_REJECTIONS, OPENAI_LITMUS_CHECKS, CODEX_MODEL_CONFIG_FLAG, CODEX_WEB_SEARCH_FLAG, CODEX_REASONING_EFFORT_FLAG, CC_BACKGROUND_DEFAULT_SINCE } from './constants';
 import { OVERUSED_FONTS_DISPLAY, BANNED_FONTS, FONTS_BODY_UI_OK, FONTS_MONO_OK, FONTS_VERIFIED_FREE, HANDOFF_COMMANDS, selectCatalog, catalogEntries, renderCatalog, detectorSlopEntries, judgmentTellEntries } from '../../lib/design-catalog';
 import { SENTINEL, DETECT_EXIT_ECHO, DETECT_LIMITS } from '../../lib/design-detect-contract';
 import { DOM_DUMP_FILE } from '../../lib/dom-dump-script';
@@ -21,7 +21,7 @@ If Codex is available, run a lightweight design check on the diff:
 \`\`\`bash
 TMPERR_DRL=$(mktemp /tmp/codex-drl-XXXXXXXX)
 _REPO_ROOT=$(git rev-parse --show-toplevel) || { echo "ERROR: not in a git repo" >&2; exit 1; }
-codex exec "Review the git diff on this branch. Run 7 litmus checks (YES/NO each): ${litmusList} Flag any hard rejections: ${rejectionList} 5 most important design findings only. Reference file:line." -C "$_REPO_ROOT" -s read-only ${CODEX_MODEL_CONFIG_FLAG} -c 'model_reasoning_effort="high"' ${CODEX_WEB_SEARCH_FLAG} < /dev/null 2>"$TMPERR_DRL"
+codex exec "Review the git diff on this branch. Run 7 litmus checks (YES/NO each): ${litmusList} Flag any hard rejections: ${rejectionList} 5 most important design findings only. Reference file:line." -C "$_REPO_ROOT" -s read-only ${CODEX_MODEL_CONFIG_FLAG} ${CODEX_REASONING_EFFORT_FLAG} ${CODEX_WEB_SEARCH_FLAG} < /dev/null 2>"$TMPERR_DRL"
 \`\`\`
 
 Use a 5-minute timeout (\`timeout: 300000\`). After the command completes, read stderr:
@@ -671,11 +671,11 @@ If Codex is available, use AskUserQuestion:
 
 If user chooses A, launch both voices simultaneously:
 
-1. **Codex** (via Bash, \`model_reasoning_effort="medium"\`):
+1. **Codex** (via Bash, medium reasoning effort by default — \`GSTACK_CODEX_EFFORT\` overrides):
 \`\`\`bash
 TMPERR_SKETCH=$(mktemp /tmp/codex-sketch-XXXXXXXX)
 _REPO_ROOT=$(git rev-parse --show-toplevel) || { echo "ERROR: not in a git repo" >&2; exit 1; }
-codex exec "For this product approach, provide: a visual thesis (one sentence — mood, material, energy), a content plan (hero → support → detail → CTA), and 2 interaction ideas that change page feel. Apply beautiful defaults: composition-first, brand-first, cardless, poster not document. Be opinionated." -C "$_REPO_ROOT" -s read-only ${CODEX_MODEL_CONFIG_FLAG} -c 'model_reasoning_effort="medium"' ${CODEX_WEB_SEARCH_FLAG} < /dev/null 2>"$TMPERR_SKETCH"
+codex exec "For this product approach, provide: a visual thesis (one sentence — mood, material, energy), a content plan (hero → support → detail → CTA), and 2 interaction ideas that change page feel. Apply beautiful defaults: composition-first, brand-first, cardless, poster not document. Be opinionated." -C "$_REPO_ROOT" -s read-only ${CODEX_MODEL_CONFIG_FLAG} ${CODEX_REASONING_EFFORT_FLAG} ${CODEX_WEB_SEARCH_FLAG} < /dev/null 2>"$TMPERR_SKETCH"
 \`\`\`
 Use a 5-minute timeout (\`timeout: 300000\`). After completion: \`cat "$TMPERR_SKETCH" && rm -f "$TMPERR_SKETCH"\`
 
@@ -698,9 +698,14 @@ export function generateDesignOutsideVoices(ctx: TemplateContext): string {
   const isDesignReview = ctx.skillName === 'design-review';
   const isDesignConsultation = ctx.skillName === 'design-consultation';
 
-  // Determine opt-in behavior and reasoning effort
+  // Determine opt-in behavior. Reasoning effort: owner decision (2026-09-14)
+  // routes every Codex outside-voice launch through the shared
+  // CODEX_REASONING_EFFORT_FLAG (medium default, GSTACK_CODEX_EFFORT
+  // override) instead of a per-skill hardcoded value — design-consultation
+  // and the analytical design-review/plan-design-review paths used to
+  // diverge (medium vs a hardcoded high); now both default to medium and
+  // both pick up the same override.
   const isAutomatic = isDesignReview; // design-review runs automatically
-  const reasoningEffort = isDesignConsultation ? 'medium' : 'high'; // creative vs analytical
 
   // Build skill-specific Codex prompt
   let codexPrompt: string;
@@ -845,7 +850,7 @@ command -v codex >/dev/null 2>&1 && echo "CODEX_AVAILABLE" || echo "CODEX_NOT_AV
 \`\`\`bash
 TMPERR_DESIGN=$(mktemp /tmp/codex-design-XXXXXXXX)
 _REPO_ROOT=$(git rev-parse --show-toplevel) || { echo "ERROR: not in a git repo" >&2; exit 1; }
-codex exec "${escapedCodexPrompt}" -C "$_REPO_ROOT" -s read-only ${CODEX_MODEL_CONFIG_FLAG} -c 'model_reasoning_effort="${reasoningEffort}"' ${CODEX_WEB_SEARCH_FLAG} < /dev/null 2>"$TMPERR_DESIGN"
+codex exec "${escapedCodexPrompt}" -C "$_REPO_ROOT" -s read-only ${CODEX_MODEL_CONFIG_FLAG} ${CODEX_REASONING_EFFORT_FLAG} ${CODEX_WEB_SEARCH_FLAG} < /dev/null 2>"$TMPERR_DESIGN"
 \`\`\`
 Use a 5-minute timeout (\`timeout: 300000\`). After the command completes, read stderr:
 \`\`\`bash

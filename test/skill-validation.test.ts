@@ -1560,7 +1560,12 @@ describe('Codex skill', () => {
     expect(content).toContain('skip the Codex passes ONLY');
     // Review log
     expect(content).toContain('adversarial-review');
-    expect(content).toContain('reasoning_effort="high"');
+    // Owner decision (2026-09-14): the adversarial Codex challenge now
+    // defaults to medium via the shared CODEX_REASONING_EFFORT_FLAG
+    // (GSTACK_CODEX_EFFORT override), not a hardcoded high — see
+    // test/opposition-model-guard.test.ts.
+    expect(content).toContain('reasoning_effort=\\"${GSTACK_CODEX_EFFORT:-medium}\\"');
+    expect(content).not.toContain('reasoning_effort="high"');
     expect(content).toContain('ADVERSARIAL REVIEW SYNTHESIS');
     // Large diff structured review still gated
     expect(content).toContain('Codex structured review (large diffs only');
@@ -1571,7 +1576,11 @@ describe('Codex skill', () => {
     const content = readShipUnion();
     expect(content).toContain('Adversarial review (always-on)');
     expect(content).toContain('adversarial-review');
-    expect(content).toContain('reasoning_effort="high"');
+    // Owner decision (2026-09-14): medium via the shared
+    // CODEX_REASONING_EFFORT_FLAG, not a hardcoded high — see
+    // test/opposition-model-guard.test.ts.
+    expect(content).toContain('reasoning_effort=\\"${GSTACK_CODEX_EFFORT:-medium}\\"');
+    expect(content).not.toContain('reasoning_effort="high"');
     expect(content).toContain('Investigate and fix');
     expect(content).toContain('Claude adversarial subagent (always runs)');
   });

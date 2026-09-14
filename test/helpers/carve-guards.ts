@@ -295,7 +295,10 @@ export const CARVE_GUARDS: Record<string, CarveGuard> = {
     // the #538 opt-out + D1 evidence directive — ratio 1.104 measured.
     // #2499 project-scope MCP jq in the brain-sync block grew every tier-2+
     // skeleton ~1.5KB (entry resolution emitted once per SKILL.md).
-    maxSkeletonBytes: 76_800, // + v2.0 {{ASIDE_RESEARCH}} (Aside first, WebSearch fallback); measured 75_804
+    maxSkeletonBytes: 77_200, // + owner decision 2026-09-14: Codex second-opinion effort routed through
+    // CODEX_REASONING_EFFORT_FLAG (`-c "model_reasoning_effort=\"${GSTACK_CODEX_EFFORT:-medium}\""` vs the
+    // old shorter hardcoded `-c 'model_reasoning_effort="high"'`) — see test/opposition-model-guard.test.ts;
+    // measured 76_858
     minUnionBytes: 115_800, // Phase 4 wave 4; measured union 118,175
     mustContain: ['design doc', 'problem statement'],
     maxSizeRatio: 1.12,
