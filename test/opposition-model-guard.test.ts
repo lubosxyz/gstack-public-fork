@@ -243,33 +243,86 @@ describe('Repo-wide sweep — every resolver, template, and host output', () => 
     fs.rmSync(SWEEP_OUT, { recursive: true, force: true });
   });
 
-  // A real Codex launch line always contains one of these two subcommands.
-  // Prose ABOUT the override mechanism (e.g. "replace X with the literal
-  // `-c 'model_reasoning_effort=\"xhigh\"'` for that call") never contains
-  // "codex exec"/"codex review" on the same line, so it can't false-positive
-  // here — verified by hand for every override sentence this PR added.
-  function isCodexInvocationLine(line: string): boolean {
-    return line.includes('codex exec') || line.includes('codex review');
+  // ── Review round 2 finding (2026-09-14) ──────────────────────────────────
+  // The original line-based scan missed a real regression shape: a codex
+  // prompt argument can span MANY lines (real, unescaped newlines inside the
+  // double-quoted string — see design-review's generated multi-paragraph
+  // prompt), so "codex exec" lands on one line and the `-c
+  // 'model_reasoning_effort="..."'` flag that closes the same shell command
+  // lands dozens of lines later. Per-line matching never puts both on the
+  // same string, so a regression to a hardcoded high hidden behind a
+  // multi-line prompt passed both the source scan and the all-host render
+  // scan with ZERO reported violations (confirmed by the reviewer with an
+  // in-memory mutation).
+  //
+  // Fix: scan whole FENCED CODE BLOCKS instead of individual lines. Every
+  // real invocation (with its surrounding `TMPERR=...`/exit-handling
+  // scaffolding) lives inside exactly one ` ```bash ` fence in this
+  // codebase; prose ABOUT the override mechanism (e.g. "replace X with the
+  // literal `-c 'model_reasoning_effort=\"xhigh\"'` for that call") is
+  // always plain paragraph text OUTSIDE any fence. Scanning per-block:
+  //   - reunites a multi-line prompt with the flags that follow it (no more
+  //     false negative from a line split), and
+  //   - still can't false-positive on the override-documentation prose,
+  //     because that prose never sits inside a fence.
+  // .ts resolver SOURCE files spell their fences as escaped `\`\`\`` (they're
+  // themselves JS template literals delimited by backtick), never a literal
+  // ``` — normalized away before splitting so one implementation covers both
+  // resolver source and rendered markdown.
+  function extractFencedBlocks(content: string): string[] {
+    const normalized = content.replace(/\\`/g, '`');
+    const parts = normalized.split(/`{3,}/);
+    const blocks: string[] = [];
+    for (let i = 1; i < parts.length; i += 2) blocks.push(parts[i]);
+    return blocks;
   }
-  // A real Claude outside-voice launch line always pipes into `$CLAUDE_BIN -p`.
-  function isClaudeInvocationLine(line: string): boolean {
-    return line.includes('CLAUDE_BIN" -p');
+  // A real Codex launch always contains one of these two subcommands
+  // somewhere in its fenced block (possibly many lines before the flags).
+  function containsCodexInvocation(block: string): boolean {
+    return block.includes('codex exec') || block.includes('codex review');
   }
-  function hasHardcodedHighOrXhigh(line: string): boolean {
-    return line.includes('model_reasoning_effort="high"') || line.includes('model_reasoning_effort="xhigh"');
+  // A real Claude outside-voice launch pipes into `$CLAUDE_BIN -p`.
+  function containsClaudeInvocation(block: string): boolean {
+    return block.includes('CLAUDE_BIN" -p');
+  }
+  function hasHardcodedHighOrXhigh(block: string): boolean {
+    return block.includes('model_reasoning_effort="high"') || block.includes('model_reasoning_effort="xhigh"');
+  }
+  function summarize(block: string): string {
+    return block.trim().replace(/\s+/g, ' ').slice(0, 260);
   }
 
   function scanForCodexEffortViolations(root: string, suffix: string): string[] {
     const violations: string[] = [];
     for (const file of findFiles(root, suffix)) {
       const content = fs.readFileSync(file, 'utf-8');
-      for (const line of content.split('\n')) {
-        if (isCodexInvocationLine(line) && hasHardcodedHighOrXhigh(line)) {
-          violations.push(`${path.relative(root, file)}: ${line.trim().slice(0, 220)}`);
+      for (const block of extractFencedBlocks(content)) {
+        if (containsCodexInvocation(block) && hasHardcodedHighOrXhigh(block)) {
+          violations.push(`${path.relative(root, file)}: ${summarize(block)}`);
         }
       }
     }
     return violations;
+  }
+
+  function scanForClaudeEffortViolations(root: string, suffix: string): { violations: string[]; checked: number } {
+    const violations: string[] = [];
+    let checked = 0;
+    for (const file of findFiles(root, suffix)) {
+      const content = fs.readFileSync(file, 'utf-8');
+      for (const block of extractFencedBlocks(content)) {
+        if (!containsClaudeInvocation(block)) continue;
+        checked++;
+        const rel = path.relative(root, file);
+        if (block.includes('claude-fable-5-1')) {
+          violations.push(`${rel}: pins claude-fable-5-1: ${summarize(block)}`);
+        }
+        if (!block.includes('--effort')) {
+          violations.push(`${rel}: missing --effort flag: ${summarize(block)}`);
+        }
+      }
+    }
+    return { violations, checked };
   }
 
   test('no resolver .ts file hardcodes a Codex opposition/outside-voice default of high or xhigh', () => {
@@ -303,25 +356,86 @@ describe('Repo-wide sweep — every resolver, template, and host output', () => 
   });
 
   test('every generated Claude outside-voice invocation, on every host, is pinned and carries --effort — never claude-fable-5-1', () => {
-    const violations: string[] = [];
-    let checked = 0;
-    for (const file of findFiles(SWEEP_OUT, '.md')) {
-      const content = fs.readFileSync(file, 'utf-8');
-      for (const line of content.split('\n')) {
-        if (!isClaudeInvocationLine(line)) continue;
-        checked++;
-        const rel = path.relative(SWEEP_OUT, file);
-        if (line.includes('claude-fable-5-1')) {
-          violations.push(`${rel}: pins claude-fable-5-1: ${line.trim().slice(0, 220)}`);
-        }
-        if (!line.includes('--effort')) {
-          violations.push(`${rel}: missing --effort flag: ${line.trim().slice(0, 220)}`);
-        }
-      }
-    }
+    const { violations, checked } = scanForClaudeEffortViolations(SWEEP_OUT, '.md');
     // Guards the guard: fail loud if the sweep somehow found no Claude
-    // invocation lines at all, rather than silently passing on zero coverage.
-    expect(checked, 'no Claude outside-voice invocation lines found across any host — sweep is broken').toBeGreaterThan(0);
+    // invocation blocks at all, rather than silently passing on zero coverage.
+    expect(checked, 'no Claude outside-voice invocation blocks found across any host — sweep is broken').toBeGreaterThan(0);
     expect(violations).toEqual([]);
+  });
+
+  describe('negative controls — the sweep must actually catch a regression', () => {
+    // These feed the scanner SYNTHETIC content that reproduces the exact
+    // shape of the round-2 miss (a multi-line prompt separating "codex exec"
+    // from the flags that hardcode high) and assert it is CAUGHT — proving
+    // the fence-block rewrite above actually closes the gap, not just that
+    // it still passes on today's (already-fixed) real files.
+    let scratch: string;
+    beforeAll(() => { scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-opposition-negctl-')); });
+    afterAll(() => { fs.rmSync(scratch, { recursive: true, force: true }); });
+
+    test('catches a multi-line design-review-shaped GENERATED command with a hardcoded high', () => {
+      // Mirrors design-review/SKILL.md's real shape: a `codex exec "..."`
+      // prompt argument containing several literal newlines, only closing
+      // (with the effort flag) many lines later — exactly what a regression
+      // to design.ts's old `isDesignReview ? 'high' : 'medium'` branch would
+      // render.
+      const synthetic = [
+        '## Design Outside Voices',
+        '',
+        '```bash',
+        'TMPERR_DESIGN=$(mktemp /tmp/codex-design-XXXXXXXX)',
+        '_REPO_ROOT=$(git rev-parse --show-toplevel) || { echo "ERROR: not in a git repo" >&2; exit 1; }',
+        'codex exec "Review the frontend source code in this repo. Evaluate against these design hard rules:',
+        '- Spacing: systematic (design tokens / CSS variables) or magic numbers?',
+        '- Typography: expressive purposeful fonts or default stacks?',
+        '',
+        'LITMUS CHECKS — answer YES/NO:',
+        '1. Brand/product unmistakable in first screen?',
+        '',
+        'Be specific. Reference file:line for every finding." -C "$_REPO_ROOT" -s read-only -c "model=\\"gpt-6-astra\\"" -c \'model_reasoning_effort="high"\' -c \'web_search="cached"\' < /dev/null 2>"$TMPERR_DESIGN"',
+        '```',
+        '',
+      ].join('\n');
+      const file = path.join(scratch, 'fake-design-review-SKILL.md');
+      fs.writeFileSync(file, synthetic);
+      const violations = scanForCodexEffortViolations(scratch, '.md');
+      expect(violations.length).toBeGreaterThan(0);
+      expect(violations[0]).toContain('fake-design-review-SKILL.md');
+      fs.rmSync(file);
+    });
+
+    test('catches the same regression shape in a RESOLVER-SOURCE (.ts) mutation, escaped-backtick fences included', () => {
+      // Reproduces the bug class directly in a scripts/resolvers/*.ts-shaped
+      // file: a hardcoded high on the codex invocation, with a multi-line
+      // prompt separating "codex exec" from the flag that closes it, inside
+      // a JS template literal whose markdown fences are ESCAPED (`\`\`\`bash`,
+      // not a literal ```) because the real backtick is the template
+      // literal's own delimiter — exactly how review.ts/design.ts render
+      // their fenced bash blocks. Proves extractFencedBlocks' backtick
+      // normalization + multi-line reunification also works on resolver
+      // source, not just rendered markdown.
+      const lines = [
+        'export function generateDesignOutsideVoicesFAKE(_ctx) {',
+        '  // REGRESSION: hardcoded high instead of CODEX_REASONING_EFFORT_FLAG.',
+        '  return `',
+        '1. **Codex design voice** (via Bash):',
+        '\\`\\`\\`bash',
+        'TMPERR_DESIGN=$(mktemp /tmp/codex-design-XXXXXXXX)',
+        '_REPO_ROOT=$(git rev-parse --show-toplevel) || { echo "ERROR: not in a git repo" >&2; exit 1; }',
+        'codex exec "Review the frontend source code in this repo. Evaluate against these design hard rules:',
+        '- Spacing: systematic (design tokens / CSS variables) or magic numbers?',
+        '',
+        'Be specific." -C "$_REPO_ROOT" -s read-only ${CODEX_MODEL_CONFIG_FLAG} -c \'model_reasoning_effort="high"\' ${CODEX_WEB_SEARCH_FLAG} < /dev/null 2>"$TMPERR_DESIGN"',
+        '\\`\\`\\`',
+        '`;',
+        '}',
+      ];
+      const file = path.join(scratch, 'fake-design-resolver.ts');
+      fs.writeFileSync(file, lines.join('\n'));
+      const violations = scanForCodexEffortViolations(scratch, '.ts');
+      expect(violations.length).toBeGreaterThan(0);
+      expect(violations[0]).toContain('fake-design-resolver.ts');
+      fs.rmSync(file);
+    });
   });
 });
