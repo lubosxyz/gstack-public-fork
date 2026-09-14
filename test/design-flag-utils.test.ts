@@ -90,12 +90,16 @@ describe("parseIntFlag contract (#2032, codex 17a-c)", () => {
 
 describe("normalizeIntFlag CLI wrapper (exit-1 semantics)", () => {
   function runWrapper(rawExpr: string, specExpr: string): { status: number; stderr: string } {
+    // Forward slashes: a raw Windows ROOT embeds backslashes into the eval
+    // string where they act as ESCAPES ("D:\\a\\gstack" imports as
+    // "D:agstack" — first Windows lane run). Import specifiers accept
+    // forward slashes on every platform.
     const script = `
-      import { normalizeIntFlag } from "${ROOT}/design/src/flag-utils";
+      import { normalizeIntFlag } from "${ROOT.replaceAll('\\', '/')}/design/src/flag-utils";
       const v = normalizeIntFlag(${rawExpr}, ${specExpr});
       console.log("VALUE:" + v);
     `;
-    const res = spawnSync("bun", ["-e", script], { encoding: "utf-8", cwd: ROOT });
+    const res = spawnSync("bun", ["-e", script], { encoding: "utf-8", cwd: ROOT, timeout: 30_000 });
     return { status: res.status ?? -1, stderr: res.stderr ?? "" };
   }
 

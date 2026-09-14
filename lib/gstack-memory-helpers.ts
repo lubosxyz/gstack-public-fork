@@ -17,7 +17,9 @@
  * helper warns once and returns an empty findings list — fail-safe defaults.
  */
 
-import { existsSync, readFileSync, writeFileSync, mkdirSync, statSync, appendFileSync } from "fs";
+import { existsSync, readFileSync, writeFileSync, mkdirSync, statSync } from "fs";
+import { appendJsonl } from "./jsonl-store";
+import { gbrainConfigDir, isExecTimeout } from "./gbrain-exec";
 import { dirname, join } from "path";
 import { execFileSync } from "child_process";
 import { homedir } from "os";
@@ -124,25 +126,111 @@ export function canonicalizeRemote(url: string | null | undefined): string {
 // ── Public: secretScanFile (gitleaks wrapper) ─────────────────────────────
 
 let _gitleaksAvailability: boolean | null = null;
+// Two flags, not one: "slow" and "absent" are different messages with
+// different remediations, and a slow warning early in a run must not
+// suppress the permanent "not in PATH; scanning disabled" warning later.
+let _gitleaksSlowWarned = false;
+let _gitleaksAbsentWarned = false;
+// Per-run cooldown: retrying a slow probe on EVERY file re-pays up to
+// probe+retry (12s default) per file — an 887-file ingest on a loaded box
+// spent hours asking the same slow question. After this many consecutive
+// slow answers the run stops probing; the availability cache is still never
+// written (slow != absent — the next PROCESS probes fresh).
+const GITLEAKS_SLOW_PROBE_LIMIT = 3;
+let _gitleaksConsecutiveSlow = 0;
+let _gitleaksCooldownWarned = false;
 
-function gitleaksAvailable(): boolean {
-  if (_gitleaksAvailability !== null) return _gitleaksAvailability;
+// Probe budgets. The first is short because the common answers (a real
+// gitleaks, or ENOENT) are both immediate; the second is generous because by
+// then we know the box is busy, not that the binary is absent.
+const GITLEAKS_PROBE_MS = 2_000;
+const GITLEAKS_RETRY_MS = 10_000;
+let _probeMs = GITLEAKS_PROBE_MS;
+let _retryMs = GITLEAKS_RETRY_MS;
+
+/**
+ * Probe outcome. "slow" is the load case: the binary may well be installed,
+ * the machine just did not get around to answering. It is deliberately NOT
+ * folded into "absent" — see gitleaksAvailable().
+ */
+type GitleaksProbe = "ok" | "absent" | "slow";
+
+function probeGitleaks(timeoutMs: number): GitleaksProbe {
   try {
     execFileSync("gitleaks", ["version"], {
       env: process.env,
       stdio: "ignore",
-      timeout: 2_000,
+      timeout: timeoutMs,
     });
+    return "ok";
+  } catch (err) {
+    const e = err as NodeJS.ErrnoException;
+    if (e?.code === "ENOENT") return "absent";
+    if (isExecTimeout(err)) return "slow";
+    // Present but unusable (non-zero exit, EACCES). Practically the same as
+    // absent, and equally permanent for this process.
+    return "absent";
+  }
+}
+
+/**
+ * Is gitleaks usable? Answers are cached for the process — EXCEPT a timeout.
+ *
+ * Caching a timeout was a fail-open bug: one busy moment (observed under the
+ * 7-way sharded test runner, where spawning a shell script took over 2s) set
+ * availability to false for the whole run, and every later file was ingested
+ * unscanned behind a single stderr line. A missing binary is a fact and stays
+ * cached; a slow answer is a condition and gets retried on the next file.
+ */
+function gitleaksAvailable(): boolean {
+  if (_gitleaksAvailability !== null) return _gitleaksAvailability;
+  if (_gitleaksConsecutiveSlow >= GITLEAKS_SLOW_PROBE_LIMIT) {
+    if (!_gitleaksCooldownWarned) {
+      _gitleaksCooldownWarned = true;
+      process.stderr.write(
+        "[gstack-memory-helpers] gitleaks did not answer in " +
+        `${GITLEAKS_SLOW_PROBE_LIMIT} consecutive probes; skipping the probe ` +
+        "for the rest of this run — remaining files go unscanned. Re-run when " +
+        "the machine is less loaded to scan them.\n"
+      );
+    }
+    return false;
+  }
+
+  let probe = probeGitleaks(_probeMs);
+  if (probe === "slow") probe = probeGitleaks(_retryMs);
+
+  if (probe === "ok") {
     _gitleaksAvailability = true;
-  } catch {
-    _gitleaksAvailability = false;
-    // Only warn once per process — Lane E will vendor the binary.
+    _gitleaksConsecutiveSlow = 0;
+    return true;
+  }
+
+  if (probe === "slow") {
+    // No cache write: leave the question open for the next call — but count
+    // it, so a persistently loaded box stops paying probe+retry per file.
+    _gitleaksConsecutiveSlow++;
+    if (!_gitleaksSlowWarned) {
+      _gitleaksSlowWarned = true;
+      process.stderr.write(
+        "[gstack-memory-helpers] gitleaks did not answer in " +
+        `${Math.round((_probeMs + _retryMs) / 1000)}s (machine under load); ` +
+        "this file goes unscanned and the probe retries on the next one.\n"
+      );
+    }
+    return false;
+  }
+
+  _gitleaksAvailability = false;
+  // Only warn once per process — Lane E will vendor the binary.
+  if (!_gitleaksAbsentWarned) {
+    _gitleaksAbsentWarned = true;
     process.stderr.write(
       "[gstack-memory-helpers] gitleaks not in PATH; secret scanning disabled. " +
       "Run /setup-gbrain to install (or `brew install gitleaks`).\n"
     );
   }
-  return _gitleaksAvailability;
+  return false;
 }
 
 /**
@@ -255,12 +343,13 @@ export function detectEngineTier(): EngineDetect {
 }
 
 // Returns gbrain's config.json path, honoring GBRAIN_HOME env var with a
-// fallback to ~/.gbrain. gbrain >=0.25 dropped the top-level `engine` field
+// fallback to ~/.gbrain. Resolution matches gbrain's own configDir()
+// contract (#2521): GBRAIN_HOME is a parent dir, `.gbrain` is appended.
+// gbrain >=0.25 dropped the top-level `engine` field
 // from doctor output, so this file is the only reliable source for engine
 // detection on that version. See #1415.
 function gbrainConfigPath(): string {
-  const root = process.env.GBRAIN_HOME || join(homedir(), ".gbrain");
-  return join(root, "config.json");
+  return join(gbrainConfigDir(process.env), "config.json");
 }
 
 // Best-effort JSONL append to ~/.gstack/.gbrain-errors.jsonl. Never throws.
@@ -268,11 +357,7 @@ function logGbrainError(kind: string, detail: string): void {
   try {
     const path = errorLogPath();
     mkdirSync(dirname(path), { recursive: true });
-    appendFileSync(
-      path,
-      JSON.stringify({ ts: new Date().toISOString(), kind, detail: detail.slice(0, 500) }) + "\n",
-      "utf-8"
-    );
+    appendJsonl(path, { ts: new Date().toISOString(), kind, detail: detail.slice(0, 500) });
   } catch { /* logging is best-effort */ }
 }
 
@@ -505,7 +590,7 @@ function logErrorContext(entry: ErrorContextEntry): void {
   try {
     const path = errorLogPath();
     mkdirSync(dirname(path), { recursive: true });
-    appendFileSync(path, JSON.stringify(entry) + "\n", "utf-8");
+    appendJsonl(path, entry);
   } catch {
     // Logging failure is non-fatal — never block the op.
   }
@@ -514,4 +599,23 @@ function logErrorContext(entry: ErrorContextEntry): void {
 // Test-only export for resetting the gitleaks availability cache between tests.
 export function _resetGitleaksAvailabilityCache(): void {
   _gitleaksAvailability = null;
+  _gitleaksSlowWarned = false;
+  _gitleaksAbsentWarned = false;
+  _gitleaksConsecutiveSlow = 0;
+  _gitleaksCooldownWarned = false;
+  _probeMs = GITLEAKS_PROBE_MS;
+  _retryMs = GITLEAKS_RETRY_MS;
+}
+
+// Test-only: shrink the probe budgets so the slow path can be exercised
+// without a multi-second sleep in the suite. Reset restores the defaults.
+export function _setGitleaksProbeTimeouts(first: number, second: number): void {
+  _probeMs = first;
+  _retryMs = second;
+}
+
+// Test-only: read the cache without triggering a probe. `null` means the
+// question is still open — which is the whole point of the timeout path.
+export function _gitleaksCacheState(): boolean | null {
+  return _gitleaksAvailability;
 }

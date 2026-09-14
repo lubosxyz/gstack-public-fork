@@ -9,17 +9,15 @@
  * Used by skill:check and CI freshness checks.
  */
 
-import { COMMAND_DESCRIPTIONS } from '../browse/src/commands';
-import { SNAPSHOT_FLAGS } from '../browse/src/snapshot';
 import { discoverTemplates, discoverSectionTemplates } from './discover-skills';
 import { writeLlmsTxt } from './gen-llms-txt';
+import { generateDesignChecklistMd } from './resolvers/design-checklist';
+import { DOM_DUMP_SCRIPT, DOM_DUMP_FILE } from '../lib/dom-dump-script';
 import * as fs from 'fs';
 import * as path from 'path';
 import type { Host, TemplateContext } from './resolvers/types';
-import { HOST_PATHS, unwrapResolver } from './resolvers/types';
+import { HOST_PATHS } from './resolvers/types';
 import { RESOLVERS } from './resolvers/index';
-import { externalSkillName, extractHookSafetyProse as _extractHookSafetyProse, extractNameAndDescription as _extractNameAndDescription, condenseOpenAIShortDescription as _condenseOpenAIShortDescription, generateOpenAIYaml as _generateOpenAIYaml } from './resolvers/codex-helpers';
-import { generatePlanCompletionAuditShip, generatePlanCompletionAuditReview, generatePlanVerificationExec } from './resolvers/review';
 import { ALL_HOST_CONFIGS, ALL_HOST_NAMES, resolveHostArg, getHostConfig } from '../hosts/index';
 import type { HostConfig } from './host-config';
 
@@ -48,14 +46,14 @@ function loadGbrainOverride(): { detected: boolean } {
   try {
     const json = JSON.parse(fs.readFileSync(detectionPath, 'utf-8')) as { gbrain_local_status?: string };
     // "timeout" = slow-but-healthy engine (#1964); "thin-client" = remote-HTTP
-    // MCP brain with no local engine by design (#2051). Both usable — same
-    // treatment as "ok", matching gstack-gbrain-detect --is-ok.
-    return {
-      detected:
-        json.gbrain_local_status === 'ok' ||
-        json.gbrain_local_status === 'timeout' ||
-        json.gbrain_local_status === 'thin-client',
-    };
+    // MCP brain with no local engine by design (#2051); "engine-locked" = same
+    // class (#2456): PGLite is single-writer, so a live `gbrain serve` (e.g.
+    // an MCP server) owns the embedded DB — gbrain is installed and healthy,
+    // a legitimate holder has the lock, so a transient lock must not silently
+    // strip brain blocks from every SKILL.md. All usable — same treatment as
+    // "ok", matching gstack-gbrain-detect --is-ok.
+    const USABLE = ['ok', 'timeout', 'thin-client', 'engine-locked'];
+    return { detected: USABLE.includes(json.gbrain_local_status ?? '') };
   } catch {
     return { detected: false };
   }
@@ -96,12 +94,13 @@ const HOST_ARG_VAL: HostArg = (() => {
 let HOST: Host = HOST_ARG_VAL === 'all' ? 'claude' : HOST_ARG_VAL;
 
 // ─── Model Overlay Selection ────────────────────────────────
-// --model is explicit. We do NOT auto-detect from host (host ≠ model).
-// Default is 'claude'. Missing overlay file → empty string (graceful).
+// --model is explicit. Without it, each host uses HostConfig.defaultModel.
+// Host defaults are generation fallbacks, not claims that host === model.
+// Missing overlay file → empty string (graceful).
 import { ALL_MODEL_NAMES, resolveModel, type Model } from './models';
 const MODEL_ARG = process.argv.find(a => a.startsWith('--model'));
-const MODEL_ARG_VAL: Model = (() => {
-  if (!MODEL_ARG) return 'claude';
+const MODEL_ARG_VAL: Model | null = (() => {
+  if (!MODEL_ARG) return null;
   const val = MODEL_ARG.includes('=') ? MODEL_ARG.split('=')[1] : process.argv[process.argv.indexOf(MODEL_ARG) + 1];
   const resolved = resolveModel(val);
   if (!resolved) {
@@ -110,10 +109,13 @@ const MODEL_ARG_VAL: Model = (() => {
   return resolved;
 })();
 
+function generationModelForHost(host: Host): Model {
+  return MODEL_ARG_VAL ?? getHostConfig(host).defaultModel;
+}
+
 // ─── Catalog Mode (v1.45.0.0 T4) ────────────────────────────
-// 'trim' (default): shorten frontmatter description to lead sentence,
-// move routing/voice prose into a "## When to invoke" body section, and
-// emit scripts/proactive-suggestions.json (single file across all skills).
+// 'trim' (default): shorten frontmatter description to lead sentence and
+// move routing/voice prose into a "## When to invoke" body section.
 // 'full': legacy v1.44 behavior — full description stays in frontmatter.
 const CATALOG_MODE_ARG = process.argv.find(a => a.startsWith('--catalog-mode'));
 const CATALOG_MODE: 'trim' | 'full' = (() => {
@@ -146,35 +148,60 @@ const EXPLAIN_LEVEL: 'default' | 'terse' = (() => {
 })();
 
 // ─── Out-dir (dev workspace render isolation) ───────────────
-// --out-dir <abs-dir> redirects Claude SKILL.md + section output to a separate
-// (untracked) directory instead of writing in place, AND rewrites the literal
-// section-base path (`~/.claude/skills/gstack/<skill>/sections/`) inside the
-// generated content to point at the out-dir, so section Reads resolve to the
-// rendered copy rather than the global install. Used by bin/dev-setup to render
-// the gbrain `:user` variant for a Conductor workspace without dirtying tracked
-// source. Default (unset) = in-place, behavior unchanged. Claude host only.
-const OUT_DIR_ARG = process.argv.find(a => a.startsWith('--out-dir'));
-const OUT_DIR: string | null = (() => {
-  if (!OUT_DIR_ARG) return null;
-  const val = OUT_DIR_ARG.includes('=')
-    ? OUT_DIR_ARG.split('=')[1]
-    : process.argv[process.argv.indexOf(OUT_DIR_ARG) + 1];
-  if (!val) throw new Error('--out-dir requires a directory path');
+// --out-dir <abs-dir> redirects ALL generated output (Claude SKILL.md +
+// sections, external-host trees like .agents/.factory, openclaw docs,
+// gstack/llms.txt) into a separate (untracked) directory instead of writing
+// in place. OUTPUTS ONLY: inputs (templates, sections/, host configs) are
+// always read from ROOT. For the Claude host it ALSO rewrites the literal
+// section-base path (`~/.claude/skills/gstack/<skill>/sections/`) inside
+// generated content so section Reads resolve to the rendered copy — that
+// rewrite stays Claude-only (external hosts have their own path grammar).
+// Consumers: bin/dev-setup (renders the gbrain `:user` variant for a
+// Conductor workspace — byte-compat pinned by gen-skill-docs-out-dir tests)
+// and the former TREE_MUTATING tests, which render into a mkdtemp instead
+// of mutating the live tree. Default (unset) = in-place, unchanged.
+/** Parse `--flag <path>` / `--flag=<path>` into an absolute path, or null when absent. */
+function parsePathFlag(flag: string): string | null {
+  const arg = process.argv.find(a => a.startsWith(flag));
+  if (!arg) return null;
+  const val = arg.includes('=')
+    ? arg.split('=')[1]
+    : process.argv[process.argv.indexOf(arg) + 1];
+  if (!val) throw new Error(`${flag} requires a directory path`);
   return path.resolve(val);
-})();
+}
+const OUT_DIR: string | null = parsePathFlag('--out-dir');
+
+// External-host outputs rendered in THIS run, keyed by host. Used after the
+// render to prune `gstack-*` output dirs whose skill no longer exists: the
+// generator never deleted, so a retired skill stayed rendered (and linked by
+// setup) forever, still reading config keys the DEFAULTS table had dropped.
+const RENDERED_EXTERNAL: Map<string, Set<string>> = new Map();
+
+// #2692: callers that render into a TMP dir and atomically swap it into place
+// (bin/gstack-config gbrain-refresh, setup — the #2569 pattern) must pass the
+// FINAL directory here, or rewriteSectionBase bakes the tmp path
+// (…/render/claude.tmp.<pid>/…) into the rendered CONTENT and every section
+// Read dies after the swap. Defaults to OUT_DIR for direct-render callers
+// (bin/dev-setup, scripts/dev-skill.ts, mkdtemp tests), where out-dir IS the
+// serving path.
+const LINK_ROOT: string | null = parsePathFlag('--link-root') ?? OUT_DIR;
 
 /**
  * When rendering to an out-dir, repoint the literal section-base path at the
- * out-dir so section Reads resolve to the rendered copy, not the global install.
+ * link root (--link-root, defaulting to --out-dir) so section Reads resolve
+ * to the SERVED copy, not the global install.
  * Surgical: ONLY paths containing `/sections/` are rewritten — bin/, browse/,
  * docs/ references keep pointing at `~/.claude/skills/gstack` (the global
- * install, which still works). No-op when --out-dir is unset.
+ * install, which still works). No-op when neither flag is set.
  */
 function rewriteSectionBase(content: string): string {
-  if (!OUT_DIR) return content;
+  if (!LINK_ROOT) return content;
+  // Replacement CALLBACK, not a template string: `$` sequences in a
+  // configured path are special in JS replacement strings ($&, $', $1…).
   return content.replace(
     /~\/\.claude\/skills\/gstack\/([^\s)`"'*]+\/sections\/)/g,
-    `${OUT_DIR}/$1`,
+    (_m, p1: string) => `${LINK_ROOT}/${p1}`,
   );
 }
 
@@ -184,7 +211,8 @@ function rewriteSectionBase(content: string): string {
 
 // ─── External Host Helpers ───────────────────────────────────
 
-// Re-export local copy for use in this file (matches codex-helpers.ts)
+// Canonical implementation (the codex-helpers.ts shadow copy was deleted —
+// it was imported, immediately shadowed by this declaration, and stale)
 // Accepts optional frontmatter name to support directory/invocation name divergence
 function externalSkillName(skillDir: string, frontmatterName?: string): string {
   // Root skill (skillDir === '' or '.') always maps to 'gstack' regardless of frontmatter
@@ -299,9 +327,7 @@ export { extractVoiceTriggers, processVoiceTriggers };
 // session pays for the full text. The catalog trim splits the description
 // into a one-line catalog entry (lead sentence + "(gstack)") that stays in
 // the frontmatter, and a "## When to invoke" body section that holds the
-// routing/voice triggers prose for in-skill discovery. A registry written
-// to scripts/proactive-suggestions.json (one entry per skill) makes routing
-// available to agents that need it without paying the always-loaded cost.
+// routing/voice triggers prose for in-skill discovery.
 //
 // Opt-out: `--catalog-mode=full` keeps v1.44 behavior (no trim, full
 // description in frontmatter). Use when debugging routing regressions or
@@ -323,12 +349,16 @@ export function splitCatalogDescription(description: string): CatalogParts {
   const hasGstackTag = /\(gstack\)/.test(working);
   if (hasGstackTag) working = working.replace(/\(gstack\)/, '').trim();
 
-  // Lead = first sentence (up to first period followed by space or end of string).
-  // We tolerate sentences with embedded periods (URLs, "v1.45.0.0") by requiring
-  // the period to be followed by whitespace OR end-of-text.
+  // Lead = first sentence, ending at the first `.`/`!`/`?` that is followed by
+  // whitespace or end-of-text. Terminator chars NOT followed by whitespace/end
+  // (embedded periods in "TODOS.md", URLs, "v1.45.0.0") are consumed by the
+  // second alternative `[.!?](?!\s|$)` and do NOT end the sentence. The two
+  // alternatives are disjoint character classes, so there is no ambiguity and
+  // no catastrophic-backtracking risk. If no terminator-followed-by-boundary
+  // exists at all, we fall back to a 20-word cut below.
   // First normalize to single-line for sentence detection, then back out.
   const collapsed = working.replace(/\s+/g, ' ').trim();
-  const sentenceMatch = collapsed.match(/^([^.!?]*[.!?])(?:\s|$)/);
+  const sentenceMatch = collapsed.match(/^((?:[^.!?]|[.!?](?!\s|$))*[.!?])(?:\s|$)/);
   // sentenceLead is the FULL first sentence (no truncation). We compute routing
   // from this position, then optionally truncate the displayed lead afterwards.
   // Truncating first then computing routing was the v1.45.0.0 bug — when the
@@ -415,6 +445,7 @@ export function toYamlInlineScalar(s: string): string {
     s !== s.trim() ||                       // leading/trailing whitespace
     /:(\s|$)/.test(s) ||                    // "foo: bar" / trailing colon → mapping ambiguity
     /\s#/.test(s) ||                        // " #" → inline comment
+    /\.\.\./.test(s) ||                     // "..." → document-end marker; strict parsers reject mid-scalar (catalog-trim truncation appends it)
     /^[\s>|&*!%@`"'#,\[\]{}?-]/.test(s);    // leading YAML indicator char
   return needsQuote ? JSON.stringify(s) : s;
 }
@@ -426,8 +457,7 @@ export function toYamlInlineScalar(s: string): string {
  *    (so it lands near the top of body content, where routing guidance
  *    belongs)
  *
- * Returns the rewritten content plus the parts (used for proactive-suggestions
- * JSON aggregation at the end of the run).
+ * Returns the rewritten content plus the extracted parts.
  */
 export function applyCatalogTrim(content: string, skillName: string): { content: string; parts: CatalogParts } | null {
   // Locate description block in frontmatter
@@ -670,12 +700,32 @@ function applyHostRewrites(content: string, hostConfig: HostConfig): string {
  * unresolved. Extracted so SKILL.md and section templates resolve through the
  * exact same path — a security/sanitization fix to one can't miss the other.
  */
+/**
+ * A second {{PREAMBLE}} in one template re-expands the entire ~12K-token
+ * preamble mid-document (#2508/#2362 — a PROSE mention of the macro in
+ * spec/SKILL.md.tmpl expanded it a second time, +43KB per /spec load).
+ * Resolution is context-blind, so any second occurrence — code fence, prose,
+ * anywhere — is a generation error, never intentional. Throw at render time
+ * so the mistake cannot reach a generated SKILL.md again.
+ */
+export function assertSinglePreamble(tmplContent: string, relTmplPath: string): void {
+  const count = (tmplContent.match(/\{\{PREAMBLE\}\}/g) || []).length;
+  if (count > 1) {
+    throw new Error(
+      `${relTmplPath} contains {{PREAMBLE}} ${count} times — a template may reference it `
+      + `at most once (each occurrence expands the full preamble; see #2508/#2362). `
+      + `Refer to "the preamble" in prose instead of the macro.`,
+    );
+  }
+}
+
 function resolvePlaceholders(
   tmplContent: string,
   ctx: TemplateContext,
   hostConfig: HostConfig,
   relTmplPath: string,
 ): string {
+  assertSinglePreamble(tmplContent, relTmplPath);
   // effectiveSuppressedResolvers() honors --respect-detection: when gbrain is
   // detected locally, GBRAIN_* resolvers un-suppress. Shared by SKILL.md and
   // section generation so both paths get the same gbrain-aware behavior.
@@ -686,10 +736,8 @@ function resolvePlaceholders(
       const resolverName = parts[0];
       const args = parts.slice(1);
       if (suppressed.has(resolverName)) return '';
-      const entry = RESOLVERS[resolverName];
-      if (!entry) throw new Error(`Unknown placeholder {{${resolverName}}} in ${relTmplPath}`);
-      const { resolve, appliesTo } = unwrapResolver(entry);
-      if (appliesTo && !appliesTo(ctx)) return '';
+      const resolve = RESOLVERS[resolverName];
+      if (!resolve) throw new Error(`Unknown placeholder {{${resolverName}}} in ${relTmplPath}`);
       return args.length > 0 ? resolve(ctx, args) : resolve(ctx);
     });
 
@@ -737,7 +785,7 @@ function buildContext(
   const interactive = interactiveMatch ? interactiveMatch[1] === 'true' : undefined;
   return {
     skillName, tmplPath, benefitsFrom, host, paths: HOST_PATHS[host],
-    preambleTier, model: MODEL_ARG_VAL, interactive, explainLevel: EXPLAIN_LEVEL,
+    preambleTier, model: generationModelForHost(host), interactive, explainLevel: EXPLAIN_LEVEL,
   };
 }
 
@@ -757,7 +805,10 @@ function processExternalHost(
   const hostConfig = getHostConfig(host);
 
   const name = externalSkillName(skillDir === '.' ? '' : skillDir, frontmatterName);
-  const outputDir = path.join(ROOT, hostConfig.hostSubdir, 'skills', name);
+  // --out-dir mirrors the host tree (outputs only; inputs read from ROOT).
+  const outputDir = path.join(OUT_DIR ?? ROOT, hostConfig.hostSubdir, 'skills', name);
+  if (!RENDERED_EXTERNAL.has(host)) RENDERED_EXTERNAL.set(host, new Set());
+  RENDERED_EXTERNAL.get(host)!.add(name);
   fs.mkdirSync(outputDir, { recursive: true });
   const outputPath = path.join(outputDir, 'SKILL.md');
 
@@ -801,16 +852,23 @@ function processExternalHost(
   return { content: result, outputPath, outputDir, symlinkLoop };
 }
 
-function processTemplate(tmplPath: string, host: Host = 'claude'): { outputPath: string; content: string; symlinkLoop?: boolean; catalogParts?: CatalogParts | null } {
-  const tmplContent = fs.readFileSync(tmplPath, 'utf-8');
+function processTemplate(tmplPath: string, host: Host = 'claude'): { outputPath: string; content: string; symlinkLoop?: boolean } {
+  // Normalize to LF at the entry point. Templates may have CRLF on disk when
+  // checked out on Windows with core.autocrlf=true. Downstream regexes
+  // (processVoiceTriggers, transformFrontmatter) hardcode \n, so without
+  // normalization they silently no-op on CRLF — producing different output
+  // than CI (Linux, LF) and breaking the Skill Docs Freshness check.
+  // (catalogParts left the return type with the proactive-suggestions
+  // retirement — merge of the two v1.64 waves.)
+  const tmplContent = fs.readFileSync(tmplPath, 'utf-8').replace(/\r\n/g, '\n');
   const relTmplPath = path.relative(ROOT, tmplPath);
   let outputPath = tmplPath.replace(/\.tmpl$/, '');
 
   // Determine skill directory relative to ROOT
   const skillDir = path.relative(ROOT, path.dirname(tmplPath));
 
-  // --out-dir (Claude only): mirror the skill tree into the out-dir instead of
-  // writing in place. External hosts compute their own paths below.
+  // --out-dir: mirror the skill tree into the out-dir instead of writing in
+  // place (external hosts compute their own OUT_DIR-aware paths below).
   if (OUT_DIR && host === 'claude') {
     outputPath = path.join(OUT_DIR, skillDir, path.basename(tmplPath).replace(/\.tmpl$/, ''));
   }
@@ -860,19 +918,15 @@ function processTemplate(tmplPath: string, host: Host = 'claude'): { outputPath:
   }
 
   // Catalog trim (Claude only — external hosts have their own frontmatter shapes)
-  let catalogParts: CatalogParts | null = null;
   if (host === 'claude' && CATALOG_MODE === 'trim') {
     const trimmed = applyCatalogTrim(content, skillName);
-    if (trimmed) {
-      content = trimmed.content;
-      catalogParts = trimmed.parts;
-    }
+    if (trimmed) content = trimmed.content;
   }
 
   // --out-dir: repoint section-base paths to the out-dir (no-op otherwise).
   if (host === 'claude') content = rewriteSectionBase(content);
 
-  return { outputPath, content, symlinkLoop, catalogParts };
+  return { outputPath, content, symlinkLoop };
 }
 
 /**
@@ -925,7 +979,7 @@ function processSectionTemplate(
     outputPath = path.join(OUT_DIR || ROOT, skillDir, 'sections', fileName);
   } else {
     const externalName = externalSkillName(skillDir, parentName);
-    outputPath = path.join(ROOT, hostConfig.hostSubdir, 'skills', externalName, 'sections', fileName);
+    outputPath = path.join(OUT_DIR ?? ROOT, hostConfig.hostSubdir, 'skills', externalName, 'sections', fileName);
   }
   if (!DRY_RUN) fs.mkdirSync(path.dirname(outputPath), { recursive: true });
   return { outputPath, content };
@@ -938,6 +992,45 @@ function findTemplates(): string[] {
 }
 
 const ALL_HOSTS: Host[] = ALL_HOST_NAMES as Host[];
+
+/**
+ * Write one generated file, or under DRY_RUN compare it to what is on disk and
+ * print STALE/FRESH. Returns true when the file is stale (dry run) — the caller
+ * folds that into its host-level `hasChanges`. Shared by sections and the
+ * lib-derived assets; the SKILL.md loop keeps its own copy because it also
+ * handles symlink loops and the token budget.
+ */
+function emitGenerated(outputPath: string, content: string): boolean {
+  const relOutput = path.relative(OUT_DIR || ROOT, outputPath);
+  if (DRY_RUN) {
+    const existing = fs.existsSync(outputPath) ? fs.readFileSync(outputPath, 'utf-8') : '';
+    if (existing !== content) {
+      console.log(`STALE: ${relOutput}`);
+      return true;
+    }
+    console.log(`FRESH: ${relOutput}`);
+    return false;
+  }
+  if (OUT_DIR) fs.mkdirSync(path.dirname(outputPath), { recursive: true });
+  fs.writeFileSync(outputPath, content);
+  console.log(`GENERATED: ${relOutput}`);
+  return false;
+}
+
+/**
+ * The generator's whole executable body. Import-purity contract: importing
+ * this module must NEVER touch the tree — test/gen-skill-docs.test.ts pulls
+ * assertSinglePreamble via require(), test/catalog-trim.test.ts imports
+ * helpers, and before this guard existed every such import regenerated all
+ * 71 SKILL.md in place at module-load time (the root cause of half the
+ * TREE_MUTATING serial shard; hazard class #2532). Pinned by
+ * test/gen-skill-docs-import-purity.test.ts.
+ *
+ * Returns the process exit code. Kept synchronous so the module stays
+ * require()-able (see the llms.txt IIFE note below).
+ */
+
+export function main(): number {
 const hostsToRun: Host[] = HOST_ARG_VAL === 'all' ? ALL_HOSTS : [HOST];
 const failures: { host: string; error: Error }[] = [];
 
@@ -947,14 +1040,6 @@ for (const currentHost of hostsToRun) {
   try {
     let hasChanges = false;
     const tokenBudget: Array<{ skill: string; lines: number; tokens: number }> = [];
-
-    // T4 catalog trim: collect routing/voice parts across all Claude skills,
-    // then write scripts/proactive-suggestions.json once per gen-skill-docs run.
-    const proactiveAggregate: Record<string, {
-      lead: string;
-      routing: string;
-      voice_line: string | null;
-    }> = {};
 
     const currentHostConfig = getHostConfig(currentHost);
     for (const tmplPath of findTemplates()) {
@@ -969,24 +1054,7 @@ for (const currentHost of hostsToRun) {
         if (currentHostConfig.generation.skipSkills.includes(dir)) continue;
       }
 
-      const { outputPath, content, symlinkLoop, catalogParts } = processTemplate(tmplPath, currentHost);
-      if (catalogParts) {
-        // Root-skill detection: when the template lives at ROOT/SKILL.md.tmpl,
-        // path.basename(path.dirname(tmplPath)) returns the repo's directory
-        // name (e.g. "seville-v3" in a Conductor worktree, "gstack" on CI).
-        // That's non-deterministic across machines and breaks CI freshness
-        // checks. Use the frontmatter `name` field as the registry key — the
-        // root SKILL.md.tmpl declares `name: gstack` explicitly. For all other
-        // skills, `dir` matches the directory name which matches the
-        // frontmatter name by convention.
-        const isRoot = path.dirname(tmplPath) === ROOT;
-        const key = isRoot ? 'gstack' : dir;
-        proactiveAggregate[key] = {
-          lead: catalogParts.lead,
-          routing: catalogParts.routingProse,
-          voice_line: catalogParts.voiceLine,
-        };
-      }
+      const { outputPath, content, symlinkLoop } = processTemplate(tmplPath, currentHost);
       const relOutput = path.relative(OUT_DIR || ROOT, outputPath);
 
       if (symlinkLoop) {
@@ -1040,19 +1108,7 @@ for (const currentHost of hostsToRun) {
 
       const { outputPath, content } = processSectionTemplate(path.join(ROOT, sec.tmpl), sec.skillDir, currentHost);
       const relOutput = path.relative(OUT_DIR || ROOT, outputPath);
-
-      if (DRY_RUN) {
-        const existing = fs.existsSync(outputPath) ? fs.readFileSync(outputPath, 'utf-8') : '';
-        if (existing !== content) {
-          console.log(`STALE: ${relOutput}`);
-          hasChanges = true;
-        } else {
-          console.log(`FRESH: ${relOutput}`);
-        }
-      } else {
-        fs.writeFileSync(outputPath, content);
-        console.log(`GENERATED: ${relOutput}`);
-      }
+      if (emitGenerated(outputPath, content)) hasChanges = true;
 
       tokenBudget.push({
         skill: relOutput,
@@ -1061,108 +1117,47 @@ for (const currentHost of hostsToRun) {
       });
     }
 
-    // Generate gstack-lite and gstack-full for OpenClaw host
+    // ─── review/design-checklist.md (generated from lib/design-catalog.ts) ───
+    // A Claude-side runtime asset: setup links it from review/ and the other
+    // hosts copy or inline the Claude render (hosts/opencode.ts), so it is
+    // written for the CLAUDE host only. Honors OUT_DIR (outputs-only rule) and
+    // takes part in the DRY_RUN freshness gate exactly like sections above.
+    if (currentHost === 'claude'
+        && !(currentHostConfig.generation.includeSkills?.length && !currentHostConfig.generation.includeSkills.includes('review'))
+        && !currentHostConfig.generation.skipSkills?.includes('review')) {
+      // Two runtime assets derived from lib/ source: the checklist (from the
+      // catalog) and the DOM-dump script the browser engines load at runtime
+      // (from lib/dom-dump-script.ts, so the prose never carries the script).
+      const generatedAssets: Array<[string, string]> = [
+        [path.join('review', 'design-checklist.md'), generateDesignChecklistMd()],
+        [DOM_DUMP_FILE, DOM_DUMP_SCRIPT + '\n'],
+      ];
+      for (const [rel, content] of generatedAssets) {
+        if (emitGenerated(path.join(OUT_DIR ?? ROOT, rel), content)) hasChanges = true;
+      }
+    }
+
+    // Generate the OpenClaw orchestrator-injection docs (gstack-lite / gstack-full /
+    // gstack-plan CLAUDE.md snippets). Sources live in openclaw/templates/ —
+    // plain markdown, no placeholder resolution — and are copied byte-for-byte
+    // to openclaw/ at gen time.
     if (currentHost === 'openclaw' && !DRY_RUN) {
-      const openclawDir = path.join(ROOT, 'openclaw');
-      if (!fs.existsSync(openclawDir)) fs.mkdirSync(openclawDir, { recursive: true });
-
-      const gstackLite = `# gstack-lite Planning Discipline
-
-Injected by the orchestrator into spawned Claude Code sessions. Append to existing CLAUDE.md.
-
-## Planning Discipline
-1. Read every file you will modify. Understand existing patterns first.
-2. Before writing code, state your plan: what, why, which files, test case, risk.
-3. When ambiguous, prefer: completeness over shortcuts, existing patterns over new ones,
-   reversible choices over irreversible ones, safe defaults over clever ones.
-4. Self-review your changes before reporting done. Check for: missed files, broken
-   imports, untested paths, style inconsistencies.
-5. Report when done: what shipped, what decisions you made, anything uncertain.
-`;
-      fs.writeFileSync(path.join(openclawDir, 'gstack-lite-CLAUDE.md'), gstackLite);
-      console.log('GENERATED: openclaw/gstack-lite-CLAUDE.md');
-
-      const gstackFull = `# gstack-full Pipeline
-
-Injected by the orchestrator for complete feature builds. Append to existing CLAUDE.md.
-
-## Full Pipeline
-1. Read CLAUDE.md and understand the project context.
-2. Run /autoplan to review your approach (CEO + eng + design review pipeline).
-3. Implement the approved plan. Follow the planning discipline above.
-4. Run /ship to create a PR with tests, changelog, and version bump.
-5. Report back: PR URL, what shipped, decisions made, anything uncertain.
-
-Do not ask for human input until the PR is ready for review.
-`;
-      fs.writeFileSync(path.join(openclawDir, 'gstack-full-CLAUDE.md'), gstackFull);
-      console.log('GENERATED: openclaw/gstack-full-CLAUDE.md');
-
-      const gstackPlan = `# gstack-plan: Full Review Gauntlet
-
-Injected by the orchestrator when the user wants to plan a Claude Code project.
-Append to existing CLAUDE.md.
-
-## Planning Pipeline
-1. Read CLAUDE.md and understand the project context.
-2. Run /office-hours to produce a design doc (problem statement, premises, alternatives).
-3. Run /autoplan to review the design (CEO + eng + design + DX reviews + codex adversarial).
-4. Save the final reviewed plan to a file the orchestrator can reference later.
-   Write it to: plans/<project-slug>-plan-<date>.md in the current repo.
-   Include the design doc, all review decisions, and the implementation sequence.
-5. Report back to the orchestrator:
-   - Plan file path
-   - One-paragraph summary of what was designed and the key decisions
-   - List of accepted scope expansions (if any)
-   - Recommended next step (usually: spawn a new session with gstack-full to implement)
-
-Do not implement anything. This is planning only.
-The orchestrator will persist the plan link to its own memory/knowledge store.
-`;
-      fs.writeFileSync(path.join(openclawDir, 'gstack-plan-CLAUDE.md'), gstackPlan);
-      console.log('GENERATED: openclaw/gstack-plan-CLAUDE.md');
+      // Inputs from ROOT, outputs into OUT_DIR when set (outputs-only rule).
+      const openclawTemplatesDir = path.join(ROOT, 'openclaw', 'templates');
+      const openclawOutDir = path.join(OUT_DIR ?? ROOT, 'openclaw');
+      if (OUT_DIR) fs.mkdirSync(openclawOutDir, { recursive: true });
+      for (const variant of ['lite', 'full', 'plan'] as const) {
+        const fileName = `gstack-${variant}-CLAUDE.md`;
+        const content = fs.readFileSync(path.join(openclawTemplatesDir, fileName), 'utf-8');
+        fs.writeFileSync(path.join(openclawOutDir, fileName), content);
+        console.log(`GENERATED: openclaw/${fileName}`);
+      }
     }
 
     if (DRY_RUN && hasChanges) {
       console.error(`\nGenerated SKILL.md files are stale (${currentHost} host). Run: bun run gen:skill-docs --host ${currentHost}`);
-      if (HOST_ARG_VAL !== 'all') process.exit(1);
+      if (HOST_ARG_VAL !== 'all') return 1;
       failures.push({ host: currentHost, error: new Error('Stale files detected') });
-    }
-
-    // T4 catalog trim: write aggregated proactive-suggestions.json (Claude only).
-    // The JSON registry lets agents pull voice triggers / routing prose for any
-    // skill on demand instead of paying for it always-loaded in the catalog.
-    //
-    // No timestamp field — keeps the file content-deterministic across runs so
-    // CI dry-run freshness checks don't flap on regen. If a per-run timestamp
-    // is ever needed for debugging, write it to a separate `.gen-stamp` file.
-    // Skip the global proactive-suggestions.json in --out-dir mode: it lives at
-    // a repo path (scripts/) and the dev workspace render doesn't need it.
-    if (currentHost === 'claude' && CATALOG_MODE === 'trim' && Object.keys(proactiveAggregate).length > 0 && !DRY_RUN && !OUT_DIR) {
-      const proactivePath = path.join(ROOT, 'scripts', 'proactive-suggestions.json');
-      // Sort keys alphabetically so the serialized JSON is identical across
-      // machines regardless of filesystem-iteration order. Without this, CI
-      // freshness checks fail when the local dev machine and CI runner
-      // discover templates in different orders.
-      const sortedSkills: typeof proactiveAggregate = {};
-      for (const key of Object.keys(proactiveAggregate).sort()) {
-        sortedSkills[key] = proactiveAggregate[key];
-      }
-      const payload = {
-        $schema: 'https://gstack.dev/schemas/proactive-suggestions.json',
-        catalog_mode: 'trim',
-        note: 'Routing / voice-trigger prose extracted from SKILL.md frontmatter descriptions during catalog trim. Loaded on demand when routing guidance is needed.',
-        skills: sortedSkills,
-      };
-      const serialized = JSON.stringify(payload, null, 2) + '\n';
-      // Only write if content actually changed — prevents needless touches that
-      // would flap CI freshness checks. Read existing file, compare, skip write
-      // when identical.
-      let existing = '';
-      try { existing = fs.readFileSync(proactivePath, 'utf-8'); } catch { /* first run */ }
-      if (existing !== serialized) {
-        fs.writeFileSync(proactivePath, serialized);
-      }
     }
 
     // Print token budget summary
@@ -1196,7 +1191,7 @@ The orchestrator will persist the plan link to its own memory/knowledge store.
 // in the same commit" is only a real gate if every host failure is fatal here.
 if (failures.length > 0 && HOST_ARG_VAL === 'all') {
   console.error(`\n${failures.length} host(s) failed: ${failures.map(f => f.host).join(', ')}`);
-  process.exit(1);
+  return 1;
 }
 // Single host dry-run failure already handled above
 
@@ -1207,10 +1202,38 @@ if (!DRY_RUN) {
     if (fs.existsSync(configPath)) {
       const config = fs.readFileSync(configPath, 'utf-8');
       if (/^skill_prefix:\s*true/m.test(config)) {
-        console.log('\nNote: skill_prefix is true. Run gstack-relink to re-apply name: patches.');
+        console.log('\nNote: skill_prefix is true. Run gstack-relink to re-apply name: patches (it patches both the install and any active gbrain render).');
       }
     }
   } catch { /* non-fatal */ }
+}
+
+// Prune stale external-host outputs. A run always renders every skill for the
+// chosen host(s) (there is no per-skill filter), so any `gstack-*` directory
+// left in <host>/skills/ that this run did not write belongs to a skill that
+// no longer exists. Symlinks (the `gstack` sidecar), non-prefixed entries, and
+// gstack-* directories without the generated banner (someone's own skill) are
+// never touched.
+if (!DRY_RUN) {
+  // A host whose generation threw has a PARTIAL rendered set: pruning against
+  // it would delete every valid render the loop never reached. Skip those.
+  const failedHosts = new Set(failures.map((f) => f.host));
+  for (const [host, names] of RENDERED_EXTERNAL) {
+    if (failedHosts.has(host)) { console.error(`  prune skipped for ${host}: generation failed, rendered set is partial`); continue; }
+    const skillsRoot = path.join(OUT_DIR ?? ROOT, getHostConfig(host as Host).hostSubdir, 'skills');
+    let entries: fs.Dirent[] = [];
+    try { entries = fs.readdirSync(skillsRoot, { withFileTypes: true }); } catch { continue; }
+    for (const e of entries) {
+      if (e.isSymbolicLink() || !e.isDirectory() || !e.name.startsWith('gstack-') || names.has(e.name)) continue;
+      // Only a directory we provably rendered (the generated banner in its
+      // SKILL.md) may be deleted whole — a hand-authored gstack-* dir is kept.
+      let generated = false;
+      try { generated = fs.readFileSync(path.join(skillsRoot, e.name, 'SKILL.md'), 'utf-8').includes('<!-- AUTO-GENERATED from'); } catch { generated = false; }
+      if (!generated) { console.log(`  kept ${host} skills/${e.name}: not a gstack render (no generated banner)`); continue; }
+      fs.rmSync(path.join(skillsRoot, e.name), { recursive: true, force: true });
+      console.log(`  pruned stale ${host} render: ${e.name}`);
+    }
+  }
 }
 
 // Regenerate gstack/llms.txt — single-file capability index for AI agents.
@@ -1222,7 +1245,11 @@ if (!DRY_RUN) {
 if (!DRY_RUN) {
   void (async () => {
     try {
-      const result = await writeLlmsTxt();
+      const result = await writeLlmsTxt(
+        // Outputs-only rule: under --out-dir even this index lands there
+        // (a catalog-mode render must never rewrite the tracked llms.txt).
+        OUT_DIR ? { outputPath: path.join(OUT_DIR, 'gstack', 'llms.txt') } : {},
+      );
       if (result.warnings.length > 0) {
         for (const w of result.warnings) console.error(`[gen-llms-txt] WARN: ${w}`);
       } else {
@@ -1232,5 +1259,32 @@ if (!DRY_RUN) {
       const msg = err instanceof Error ? err.message : String(err);
       console.error(`[gen-llms-txt] FAILED: ${msg}`);
     }
+    // Regenerate agents-digest/gstack-AGENTS.md — the instruction-only tier
+    // for rules-reading hosts with no skill install. Committed artifact;
+    // freshness + byte budget asserted in test/agents-digest.test.ts.
+    try {
+      const { writeAgentsDigest, DIGEST_BYTE_BUDGET } = await import('./gen-agents-digest');
+      // Outputs-only rule: under --out-dir the digest lands there too — a
+      // workspace render must never rewrite the tracked committed artifact.
+      const digest = writeAgentsDigest(OUT_DIR ? { outRoot: OUT_DIR } : {});
+      console.log(`[gen-agents-digest] agents-digest/gstack-AGENTS.md: ${digest.bytes} bytes (budget ${DIGEST_BYTE_BUDGET})`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`[gen-agents-digest] FAILED: ${msg}`);
+      // The digest is a committed freshness-gated artifact: a local build
+      // that silently ships it stale defers the red to CI. Fail the build.
+      process.exitCode = 1;
+    }
   })();
+}
+
+return 0;
+}
+
+if (import.meta.main) {
+  // Failure exits are immediate (matching the old top-level process.exit
+  // behavior); success leaves the event loop to drain so the llms.txt
+  // fire-and-forget IIFE inside main() finishes its write.
+  const code = main();
+  if (code !== 0) process.exit(code);
 }

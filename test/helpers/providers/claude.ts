@@ -1,10 +1,11 @@
 import type { ProviderAdapter, RunOpts, RunResult, AvailabilityCheck } from './types';
 import { estimateCostUsd } from '../pricing';
-import { execFileSync } from 'child_process';
+import { execFileSync, spawnSync } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-import { resolveClaudeCommand } from '../../../browse/src/claude-bin';
+import { resolveClaudeCommand } from '../../../lib/claude-bin';
+import { resolveEvalModel } from '../../../lib/eval-model';
 
 /**
  * Claude adapter — wraps the `claude` CLI via claude -p.
@@ -25,11 +26,30 @@ export class ClaudeAdapter implements ProviderAdapter {
     if (!resolved) {
       return { ok: false, reason: 'claude CLI not found on PATH. Install from https://claude.ai/download or npm i -g @anthropic-ai/claude-code (or set GSTACK_CLAUDE_BIN)' };
     }
-    // Auth sniff: ~/.claude/.credentials.json OR ANTHROPIC_API_KEY
+    // Auth sniff: ~/.claude/.credentials.json OR ANTHROPIC_API_KEY OR (macOS)
+    // the Keychain entry subscription installs use instead of the creds file.
+    // #1890: the default macOS install stores OAuth under the generic-password
+    // service "Claude Code-credentials" and never writes .credentials.json,
+    // so the file-or-env sniff reported "No Claude auth found" while
+    // `claude -p` worked fine. Metadata probe only (no -w — never reads the
+    // secret), and any failure of `security` itself falls through to the
+    // not-found reason rather than throwing.
     const credsPath = path.join(os.homedir(), '.claude', '.credentials.json');
     const hasCreds = fs.existsSync(credsPath);
     const hasKey = !!process.env.ANTHROPIC_API_KEY;
-    if (!hasCreds && !hasKey) {
+    let hasKeychain = false;
+    if (!hasCreds && !hasKey && process.platform === 'darwin') {
+      try {
+        const probe = spawnSync('security', ['find-generic-password', '-s', 'Claude Code-credentials'], {
+          stdio: 'ignore',
+          timeout: 5000,
+        });
+        hasKeychain = probe.status === 0;
+      } catch {
+        hasKeychain = false;
+      }
+    }
+    if (!hasCreds && !hasKey && !hasKeychain) {
       return { ok: false, reason: 'No Claude auth found. Log in via `claude` interactive session, or export ANTHROPIC_API_KEY.' };
     }
     return { ok: true };
@@ -41,8 +61,9 @@ export class ClaudeAdapter implements ProviderAdapter {
     if (!resolved) {
       throw new Error('claude CLI not resolvable (set GSTACK_CLAUDE_BIN or install)');
     }
+    const model = opts.model ?? process.env.EVALS_MODEL ?? resolveEvalModel('capture');
     const args = [...resolved.argsPrefix, '-p', '--output-format', 'json'];
-    if (opts.model) args.push('--model', opts.model);
+    args.push('--model', model);
     if (opts.extraArgs) args.push(...opts.extraArgs);
 
     try {
@@ -62,27 +83,27 @@ export class ClaudeAdapter implements ProviderAdapter {
         tokens: parsed.tokens,
         durationMs: Date.now() - start,
         toolCalls: parsed.toolCalls,
-        modelUsed: parsed.modelUsed || opts.model || 'claude-opus-4-7',
+        modelUsed: parsed.modelUsed || model,
       };
     } catch (err: unknown) {
       const durationMs = Date.now() - start;
       const e = err as { code?: string; stderr?: Buffer; signal?: string; message?: string };
       const stderr = e.stderr?.toString() ?? '';
       if (e.signal === 'SIGTERM' || e.code === 'ETIMEDOUT') {
-        return this.emptyResult(durationMs, { code: 'timeout', reason: `exceeded ${opts.timeoutMs}ms` }, opts.model);
+        return this.emptyResult(durationMs, { code: 'timeout', reason: `exceeded ${opts.timeoutMs}ms` }, model);
       }
       if (/unauthorized|auth|login/i.test(stderr)) {
-        return this.emptyResult(durationMs, { code: 'auth', reason: stderr.slice(0, 400) }, opts.model);
+        return this.emptyResult(durationMs, { code: 'auth', reason: stderr.slice(0, 400) }, model);
       }
       if (/rate[- ]?limit|429/i.test(stderr)) {
-        return this.emptyResult(durationMs, { code: 'rate_limit', reason: stderr.slice(0, 400) }, opts.model);
+        return this.emptyResult(durationMs, { code: 'rate_limit', reason: stderr.slice(0, 400) }, model);
       }
-      return this.emptyResult(durationMs, { code: 'unknown', reason: (e.message ?? stderr ?? 'unknown').slice(0, 400) }, opts.model);
+      return this.emptyResult(durationMs, { code: 'unknown', reason: (e.message ?? stderr ?? 'unknown').slice(0, 400) }, model);
     }
   }
 
   estimateCost(tokens: { input: number; output: number; cached?: number }, model?: string): number {
-    return estimateCostUsd(tokens, model ?? 'claude-opus-4-7');
+    return estimateCostUsd(tokens, model ?? resolveEvalModel('capture'));
   }
 
   /**
@@ -118,7 +139,7 @@ export class ClaudeAdapter implements ProviderAdapter {
       tokens: { input: 0, output: 0 },
       durationMs,
       toolCalls: 0,
-      modelUsed: model ?? 'claude-opus-4-7',
+      modelUsed: model ?? resolveEvalModel('capture'),
       error,
     };
   }

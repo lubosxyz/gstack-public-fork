@@ -40,6 +40,7 @@ import {
   localEngineStatus,
   cacheFilePath,
   probeTimeoutMs,
+  probeGbrainBin,
   CACHE_TTL_MS,
   DEFAULT_PROBE_TIMEOUT_MS,
   type LocalEngineStatus,
@@ -62,10 +63,12 @@ interface FakeEnv {
  */
 function makeEnv(opts: {
   withGbrain?: boolean;
-  gbrainBehavior?: "ok" | "broken-db" | "broken-config" | "engine-locked" | "throws" | "slow" | "thin-refusal";
+  gbrainBehavior?: "ok" | "broken-db" | "broken-config" | "engine-locked" | "engine-locked-v43" | "throws" | "slow" | "slow-version" | "thin-refusal";
   withConfig?: boolean;
   /** #2051: config carries gbrain's remote_mcp thin-client marker. */
   thinClientConfig?: boolean;
+  /** #2520: content for ~/.claude.json (host MCP registrations). */
+  claudeJson?: object;
 }): FakeEnv {
   const tmp = mkdtempSync(join(tmpdir(), "gbrain-local-status-test-"));
   const bindir = join(tmp, "bin");
@@ -99,6 +102,10 @@ function makeEnv(opts: {
     chmodSync(gbrainPath, 0o755);
   }
 
+  if (opts.claudeJson) {
+    writeFileSync(join(home, ".claude.json"), JSON.stringify(opts.claudeJson));
+  }
+
   return {
     tmp,
     bindir,
@@ -110,8 +117,18 @@ function makeEnv(opts: {
 }
 
 function makeFakeGbrainScript(
-  behavior: "ok" | "broken-db" | "broken-config" | "engine-locked" | "throws" | "slow" | "thin-refusal",
+  behavior: "ok" | "broken-db" | "broken-config" | "engine-locked" | "engine-locked-v43" | "throws" | "slow" | "slow-version" | "thin-refusal",
 ): string {
+  // "slow-version": gbrain IS installed but even `--version` blows the
+  // (test-lowered) budget — the #2716 bun-shim-on-a-loaded-POSIX-box shape.
+  // Must classify as "timeout" (usable, --is-ok forgives), never "no-cli".
+  if (behavior === "slow-version") {
+    return `#!/bin/sh
+sleep 2
+echo "gbrain 0.43.0.0"
+exit 0
+`;
+  }
   // "slow": healthy engine on a cold pooler connection (#1964) — sleeps past
   // the (test-lowered) probe timeout, then would answer fine.
   if (behavior === "slow") {
@@ -135,6 +152,8 @@ exit 0
         ? 'echo "Error: malformed config.json at ~/.gbrain/config.json" >&2'
         : behavior === "engine-locked"
           ? 'echo "gbrain sources: connect timed out (default 10000ms; pass --timeout=Ns to override)." >&2'
+        : behavior === "engine-locked-v43"
+          ? "echo \"GBrains local database is already open through gbrain serve (MCP, PID 12345). This brain uses PGLite, so a separate CLI process cannot open it at the same time. Stop gbrain serve, then retry this CLI command.\" >&2"
         : behavior === "throws"
           ? 'echo "unexpected gbrain failure" >&2'
           : behavior === "thin-refusal"
@@ -204,6 +223,7 @@ describe("lib/gbrain-local-status — status classification", () => {
     );
 
     expect(source).not.toContain('command -v gbrain');
+    // tripwire-exempt: string assertion on lib source text, not a call
     expect(source).toContain('execFileSync("gbrain", ["--version"]');
   });
 
@@ -211,6 +231,21 @@ describe("lib/gbrain-local-status — status classification", () => {
     env = makeEnv({ withGbrain: false });
     restoreEnv = applyEnv(env);
     expect(localEngineStatus({ noCache: true })).toBe("no-cli");
+  });
+
+  // #2716: a present-but-slow gbrain (bun-shim install on a loaded POSIX box)
+  // used to collapse into the same `null` as a missing binary — classified
+  // "no-cli", which `--is-ok` does NOT forgive, so every brain-aware block
+  // silently disappeared. Slow-but-present must classify "timeout" (forgiven).
+  it("returns 'timeout' (not 'no-cli') when the --version probe blows its budget", () => {
+    env = makeEnv({ withGbrain: true, gbrainBehavior: "slow-version", withConfig: true });
+    restoreEnv = applyEnv(env);
+    process.env.GSTACK_GBRAIN_VERSION_PROBE_TIMEOUT_MS = "300";
+    try {
+      expect(localEngineStatus({ noCache: true })).toBe("timeout");
+    } finally {
+      delete process.env.GSTACK_GBRAIN_VERSION_PROBE_TIMEOUT_MS;
+    }
   });
 
   it("returns 'missing-config' when CLI is present but ~/.gbrain/config.json absent", () => {
@@ -243,6 +278,19 @@ describe("lib/gbrain-local-status — status classification", () => {
     expect(localEngineStatus({ noCache: true })).toBe("engine-locked");
   });
 
+  it("returns 'engine-locked' when gbrain >= 0.43 refuses with 'already open through' and exit 1", () => {
+    env = makeEnv({ withGbrain: true, gbrainBehavior: "engine-locked-v43", withConfig: true });
+    restoreEnv = applyEnv(env);
+    expect(localEngineStatus({ noCache: true })).toBe("engine-locked");
+  });
+
+  it("classifies the >= 0.43 held-lock refusal on a non-PGLite engine as broken-db", () => {
+    env = makeEnv({ withGbrain: true, gbrainBehavior: "engine-locked-v43", withConfig: true });
+    restoreEnv = applyEnv(env);
+    writeFileSync(env.configPath, JSON.stringify({ engine: "postgres", database_url: "postgres://fake" }));
+    expect(localEngineStatus({ noCache: true })).toBe("broken-db");
+  });
+
   it("classifies a non-PGLite connect timeout as unreachable DB, not malformed config", () => {
     env = makeEnv({ withGbrain: true, gbrainBehavior: "engine-locked", withConfig: true });
     restoreEnv = applyEnv(env);
@@ -263,20 +311,46 @@ describe("lib/gbrain-local-status — status classification", () => {
     expect(localEngineStatus({ noCache: true })).toBe("timeout");
   });
 
-  it("honors GBRAIN_HOME for config detection (codex D11)", () => {
-    // Config lives ONLY at the alternate GBRAIN_HOME; ~/.gbrain has none.
+  it("honors GBRAIN_HOME for config detection (codex D11) with gbrain's parent-dir semantics (#2521)", () => {
+    // Config lives ONLY under the alternate GBRAIN_HOME; ~/.gbrain has none.
+    // gbrain's configDir() treats GBRAIN_HOME as a PARENT dir and appends
+    // `.gbrain` itself: GBRAIN_HOME=/x → /x/.gbrain/config.json.
     env = makeEnv({ withGbrain: true, gbrainBehavior: "ok", withConfig: false });
     restoreEnv = applyEnv(env);
     const altHome = join(env.tmp, "alt-gbrain");
+    mkdirSync(join(altHome, ".gbrain"), { recursive: true });
+    writeFileSync(
+      join(altHome, ".gbrain", "config.json"),
+      JSON.stringify({ engine: "pglite", database_url: "pglite:///fake" }),
+    );
+    // Without GBRAIN_HOME: misclassified as missing-config.
+    expect(localEngineStatus({ noCache: true })).toBe("missing-config");
+    // With GBRAIN_HOME: the relocated config is found at $GBRAIN_HOME/.gbrain.
+    process.env.GBRAIN_HOME = altHome;
+    expect(localEngineStatus({ noCache: true })).toBe("ok");
+  });
+
+  it("does NOT read $GBRAIN_HOME/config.json directly — gbrain never reads that file (#2521)", () => {
+    // A config placed at gstack's OLD (wrong) resolution must be invisible:
+    // gbrain itself would report "No brain configured" for this layout, so
+    // gstack classifying "ok" from it is the #2521 split-brain.
+    env = makeEnv({ withGbrain: true, gbrainBehavior: "ok", withConfig: false });
+    restoreEnv = applyEnv(env);
+    const altHome = join(env.tmp, "alt-gbrain-flat");
     mkdirSync(altHome, { recursive: true });
     writeFileSync(
       join(altHome, "config.json"),
       JSON.stringify({ engine: "pglite", database_url: "pglite:///fake" }),
     );
-    // Without GBRAIN_HOME: misclassified as missing-config.
-    expect(localEngineStatus({ noCache: true })).toBe("missing-config");
-    // With GBRAIN_HOME: the relocated config is found.
     process.env.GBRAIN_HOME = altHome;
+    expect(localEngineStatus({ noCache: true })).toBe("missing-config");
+  });
+
+  it("with GBRAIN_HOME unset, config resolution stays at ~/.gbrain (#2521 unset half)", () => {
+    env = makeEnv({ withGbrain: true, gbrainBehavior: "ok", withConfig: true });
+    restoreEnv = applyEnv(env);
+    // applyEnv deletes GBRAIN_HOME; config was written at $HOME/.gbrain.
+    expect(process.env.GBRAIN_HOME).toBeUndefined();
     expect(localEngineStatus({ noCache: true })).toBe("ok");
   });
 });
@@ -326,6 +400,44 @@ describe("probeTimeoutMs — env override parsing", () => {
   it("never returns 0 for fractional sub-millisecond values (0 = NO timeout in execFileSync)", () => {
     expect(probeTimeoutMs({ GSTACK_GBRAIN_PROBE_TIMEOUT_MS: "0.5" })).toBe(1);
     expect(probeTimeoutMs({ GSTACK_GBRAIN_PROBE_TIMEOUT_MS: "0.0001" })).toBe(1);
+  });
+});
+
+describe("versionProbeTimeoutMs — invalid env overrides fall back to the default budget (behavioral via probeGbrainBin)", () => {
+  // versionProbeTimeoutMs is module-private, so pin its fallback BEHAVIOR:
+  // a fast healthy fake gbrain must probe identically whether the override
+  // env var is unset, non-numeric, or non-positive. If an invalid value ever
+  // reached execFileSync as its `timeout` (NaN / -1), the guarded call would
+  // throw into the catch and report { bin: null } — a fake "no-cli".
+  //
+  // probeGbrainBin memoizes per PATH key, so each case gets its OWN makeEnv
+  // (fresh mkdtemp bindir → unique PATH → fresh cache entry), and env is
+  // passed explicitly — no process.env mutation, no cross-case cache hits.
+  function probeWith(override?: string) {
+    const env = makeEnv({ withGbrain: true, gbrainBehavior: "ok", withConfig: true });
+    try {
+      const probeEnv: NodeJS.ProcessEnv = { PATH: `${env.bindir}:/usr/bin:/bin` };
+      if (override !== undefined) probeEnv.GSTACK_GBRAIN_VERSION_PROBE_TIMEOUT_MS = override;
+      return probeGbrainBin(probeEnv);
+    } finally {
+      env.cleanup();
+    }
+  }
+
+  it("unset override — the default-budget baseline resolves the bin", () => {
+    expect(probeWith()).toEqual({ bin: "gbrain", timedOut: false });
+  });
+
+  it("non-numeric override ('abc') behaves as the default-budget case (no throw, sane shape)", () => {
+    expect(probeWith("abc")).toEqual({ bin: "gbrain", timedOut: false });
+  });
+
+  it("negative override ('-1') behaves as the default-budget case (no throw, sane shape)", () => {
+    expect(probeWith("-1")).toEqual({ bin: "gbrain", timedOut: false });
+  });
+
+  it("zero override ('0') behaves as the default-budget case (0 would mean NO timeout)", () => {
+    expect(probeWith("0")).toEqual({ bin: "gbrain", timedOut: false });
   });
 });
 
@@ -506,6 +618,7 @@ describe("lib/gbrain-local-status — thin-client (#2051)", () => {
         GSTACK_HOME: env.gstackHome,
         GSTACK_DETECT_NO_CACHE: "1",
       },
+      timeout: 30_000,
     });
     expect(r.status).toBe(0);
   });
@@ -522,7 +635,245 @@ describe("lib/gbrain-local-status — thin-client (#2051)", () => {
         GSTACK_HOME: env.gstackHome,
         GSTACK_DETECT_NO_CACHE: "1",
       },
+      timeout: 30_000,
     });
     expect(r.status).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #2520: bearer-token thin clients (`gbrain connect --token`) — no remote_mcp
+// marker in config.json; the evidence is the host's remote-HTTP MCP
+// registration in ~/.claude.json.
+// ---------------------------------------------------------------------------
+
+describe("lib/gbrain-local-status — bearer-token thin-client (#2520)", () => {
+  let env: FakeEnv | null = null;
+  let restoreEnv: (() => void) | null = null;
+
+  afterEach(() => {
+    if (restoreEnv) restoreEnv();
+    if (env) env.cleanup();
+    env = null;
+    restoreEnv = null;
+  });
+
+  const REMOTE_GBRAIN = {
+    type: "http",
+    url: "https://brain.example.com/mcp",
+    headers: { Authorization: "Bearer test-token" },
+  };
+  const LOCAL_GBRAIN = { type: "stdio", command: "gbrain", args: ["serve"] };
+
+  it("returns 'thin-client' when config.json is absent but a remote-HTTP gbrain MCP is registered (user scope)", () => {
+    env = makeEnv({
+      withGbrain: true,
+      gbrainBehavior: "ok",
+      withConfig: false,
+      claudeJson: { mcpServers: { gbrain: REMOTE_GBRAIN } },
+    });
+    restoreEnv = applyEnv(env);
+    expect(localEngineStatus({ noCache: true })).toBe("thin-client");
+  });
+
+  it("returns 'thin-client' when config.json is absent and the registration is PROJECT-scoped for THIS cwd (#2499)", () => {
+    // The project key must be the running process's cwd (or an ancestor):
+    // per-project scoping (C15) means only registrations visible to this
+    // cwd count.
+    env = makeEnv({
+      withGbrain: true,
+      gbrainBehavior: "ok",
+      withConfig: false,
+      claudeJson: {
+        projects: { [process.cwd()]: { mcpServers: { "gbrain-remote": REMOTE_GBRAIN } } },
+      },
+    });
+    restoreEnv = applyEnv(env);
+    expect(localEngineStatus({ noCache: true })).toBe("thin-client");
+  });
+
+  it("reclassifies a failed local probe (engine-locked) as 'thin-client' when the only gbrain MCP is remote", () => {
+    // The reporter's exact shape: leftover local pglite config, dead/absent
+    // local engine (probe exits 124 "connect timed out"), brain fully working
+    // over remote-HTTP MCP with a bearer token.
+    env = makeEnv({
+      withGbrain: true,
+      gbrainBehavior: "engine-locked",
+      withConfig: true,
+      claudeJson: { mcpServers: { gbrain: REMOTE_GBRAIN } },
+    });
+    restoreEnv = applyEnv(env);
+    expect(localEngineStatus({ noCache: true })).toBe("thin-client");
+  });
+
+  it("reclassifies broken-db as 'thin-client' when the only gbrain MCP is remote", () => {
+    env = makeEnv({
+      withGbrain: true,
+      gbrainBehavior: "broken-db",
+      withConfig: true,
+      claudeJson: { mcpServers: { gbrain: REMOTE_GBRAIN } },
+    });
+    restoreEnv = applyEnv(env);
+    expect(localEngineStatus({ noCache: true })).toBe("thin-client");
+  });
+
+  it("preserves 'engine-locked' when a local-stdio gbrain MCP is ALSO registered (federation guard)", () => {
+    // A local-stdio registration means the user runs a local engine —
+    // local-engine statuses must keep their precise meaning, even if a
+    // second (e.g. team) brain is registered remote-HTTP.
+    env = makeEnv({
+      withGbrain: true,
+      gbrainBehavior: "engine-locked",
+      withConfig: true,
+      claudeJson: {
+        mcpServers: { gbrain: LOCAL_GBRAIN, "gbrain-work": REMOTE_GBRAIN },
+      },
+    });
+    restoreEnv = applyEnv(env);
+    expect(localEngineStatus({ noCache: true })).toBe("engine-locked");
+  });
+
+  it("still returns 'missing-config' when no gbrain MCP registration exists (discriminator)", () => {
+    env = makeEnv({
+      withGbrain: true,
+      gbrainBehavior: "ok",
+      withConfig: false,
+      claudeJson: { mcpServers: { "other-server": { type: "http", url: "https://x.example/mcp" } } },
+    });
+    restoreEnv = applyEnv(env);
+    expect(localEngineStatus({ noCache: true })).toBe("missing-config");
+  });
+
+  // ── C15: project scan is scoped to the cwd's nearest-ancestor project ──
+  // Before the fix, hasRemoteOnlyGbrainMcp scanned EVERY project's
+  // mcpServers, so one project's remote registration reclassified broken
+  // local engines as thin-client machine-wide.
+
+  it("C15: an OTHER project's remote entry no longer flips thin-client for this cwd (no config)", () => {
+    env = makeEnv({
+      withGbrain: true,
+      gbrainBehavior: "ok",
+      withConfig: false,
+      claudeJson: {
+        projects: { "/some/other/repo": { mcpServers: { gbrain: REMOTE_GBRAIN } } },
+      },
+    });
+    restoreEnv = applyEnv(env);
+    expect(localEngineStatus({ noCache: true })).toBe("missing-config");
+  });
+
+  it("C15: an OTHER project's remote entry no longer reclassifies a broken local engine", () => {
+    env = makeEnv({
+      withGbrain: true,
+      gbrainBehavior: "engine-locked",
+      withConfig: true,
+      claudeJson: {
+        projects: { "/some/other/repo": { mcpServers: { gbrain: REMOTE_GBRAIN } } },
+      },
+    });
+    restoreEnv = applyEnv(env);
+    expect(localEngineStatus({ noCache: true })).toBe("engine-locked");
+  });
+
+  it("C15: path boundary — a sibling-prefix project key is NOT this cwd's project", () => {
+    // /path/to/repo2 must never match a scan from /path/to/repo (and vice
+    // versa) — same boundary rule as the jq resolver and brain-cache.
+    env = makeEnv({
+      withGbrain: true,
+      gbrainBehavior: "ok",
+      withConfig: false,
+      claudeJson: {
+        projects: { [`${process.cwd()}-sibling`]: { mcpServers: { gbrain: REMOTE_GBRAIN } } },
+      },
+    });
+    restoreEnv = applyEnv(env);
+    expect(localEngineStatus({ noCache: true })).toBe("missing-config");
+  });
+
+  it("C15: an ANCESTOR project key of this cwd still counts (nearest-ancestor matching)", () => {
+    env = makeEnv({
+      withGbrain: true,
+      gbrainBehavior: "ok",
+      withConfig: false,
+      claudeJson: {
+        projects: { [dirname(process.cwd())]: { mcpServers: { gbrain: REMOTE_GBRAIN } } },
+      },
+    });
+    restoreEnv = applyEnv(env);
+    expect(localEngineStatus({ noCache: true })).toBe("thin-client");
+  });
+
+  it("C15: a nearer project WITHOUT gbrain does not shadow an ancestor's registration (jq parity)", () => {
+    env = makeEnv({
+      withGbrain: true,
+      gbrainBehavior: "ok",
+      withConfig: false,
+      claudeJson: {
+        projects: {
+          [dirname(process.cwd())]: { mcpServers: { gbrain: REMOTE_GBRAIN } },
+          [process.cwd()]: { mcpServers: { "other-server": { type: "http", url: "https://x.example/mcp" } } },
+        },
+      },
+    });
+    restoreEnv = applyEnv(env);
+    expect(localEngineStatus({ noCache: true })).toBe("thin-client");
+  });
+
+  // ── C15: adopted precedence — project-local beats user scope per name ──
+  // Claude Code's own conflict resolution, verified empirically against
+  // claude 2.1.233 with a hermetic fake $HOME (`claude mcp get gbrain`
+  // reports "Scope: Local config" when both scopes define the name).
+
+  it("C15 precedence: THIS project's remote gbrain shadows a user-scope local-stdio gbrain → thin-client", () => {
+    // Union semantics would see the user-scope stdio entry and keep
+    // engine-locked; the adopted precedence says this project's queries go
+    // remote, so thin-client is the truthful classification here.
+    env = makeEnv({
+      withGbrain: true,
+      gbrainBehavior: "engine-locked",
+      withConfig: true,
+      claudeJson: {
+        mcpServers: { gbrain: LOCAL_GBRAIN },
+        projects: { [process.cwd()]: { mcpServers: { gbrain: REMOTE_GBRAIN } } },
+      },
+    });
+    restoreEnv = applyEnv(env);
+    expect(localEngineStatus({ noCache: true })).toBe("thin-client");
+  });
+
+  it("C15 precedence: THIS project's local-stdio gbrain shadows a user-scope remote gbrain → local statuses keep their meaning", () => {
+    env = makeEnv({
+      withGbrain: true,
+      gbrainBehavior: "engine-locked",
+      withConfig: true,
+      claudeJson: {
+        mcpServers: { gbrain: REMOTE_GBRAIN },
+        projects: { [process.cwd()]: { mcpServers: { gbrain: LOCAL_GBRAIN } } },
+      },
+    });
+    restoreEnv = applyEnv(env);
+    expect(localEngineStatus({ noCache: true })).toBe("engine-locked");
+  });
+
+  it("--is-ok exits 0 on a bearer thin-client fixture (end-to-end gate)", () => {
+    env = makeEnv({
+      withGbrain: true,
+      gbrainBehavior: "engine-locked",
+      withConfig: true,
+      claudeJson: { mcpServers: { gbrain: REMOTE_GBRAIN } },
+    });
+    const detectBin = join(import.meta.dir, "..", "bin", "gstack-gbrain-detect");
+    const bunDir = dirname(process.execPath);
+    const r = spawnSync(detectBin, ["--is-ok"], {
+      encoding: "utf-8",
+      env: {
+        HOME: env.home,
+        PATH: `${env.bindir}:${bunDir}:/usr/bin:/bin`,
+        GSTACK_HOME: env.gstackHome,
+        GSTACK_DETECT_NO_CACHE: "1",
+      },
+      timeout: 30_000,
+    });
+    expect(r.status).toBe(0);
   });
 });
